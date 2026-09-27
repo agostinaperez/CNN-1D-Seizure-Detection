@@ -41,6 +41,7 @@ from src.config import (
     EVENT_N_WITHIN,
     FC_UNITS,
     LEARNING_RATE,
+    MIN_EVENT_SENSITIVITY,
     MIN_SENSITIVITY,
     MODELS_DIR,
     N_CHANNELS,
@@ -54,7 +55,7 @@ from src.config import (
     WEIGHT_DECAY,
 )
 from src.data import build_splits_dataloaders, compute_positive_weight
-from src.metrics import binary_metrics, event_metrics, select_operating_point, threshold_sweep
+from src.metrics import binary_metrics, event_metrics, select_event_operating_point, select_operating_point, threshold_sweep
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
 
@@ -160,7 +161,7 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     epoch: int, best_val_loss: float, pos_weight: float, seed: int,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
-                    op_fp_per_hour: float = float("inf")) -> None:
+                    op_fdr_per_hour: float = float("inf")) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar:
 
@@ -168,10 +169,11 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
       - config del modelo: listas de canales/kernels, fc_units, dropout, etc. (para reconstruir la arquitectura idéntica al cargar);
       - scaler_stats: mediana/IQR por canal del RobustScaler (para que inference escale las ventanas nuevas EXACTAMENTE igual que en train);
       - metadata: época, best_val_loss, pos_weight, seed (auditoría);
-      - op_*: punto de operación elegido en val (umbral, sensibilidad y fp/h).
+      - op_*: punto de operación elegido en val a nivel EVENTO (umbral, sensibilidad
+        de crisis y FDR = falsas detecciones / hora).
 
-    Se guarda en disco el momento en que el criterio clínico (menor fp/h con sens
-    >= objetivo) fue el mejor, no el loss crudo.
+    Se guarda en disco el momento en que el criterio clínico (menor FDR con sens
+    de crisis >= objetivo) fue el mejor, no el loss crudo.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -191,7 +193,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "threshold": THRESHOLD,
         "op_threshold": op_threshold,
         "op_sensibility": op_sensibility,
-        "op_fp_per_hour": op_fp_per_hour,
+        "op_fdr_per_hour": op_fdr_per_hour,
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
@@ -215,7 +217,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
     parser.add_argument("--min-sensitivity", type=float, default=MIN_SENSITIVITY,
-                        help="Sensibilidad objetivo: se elige el umbral con menor fp/h que la alcance.")
+                        help="Sensibilidad objetivo a nivel VENTANA (solo display/curva, no selecciona).")
+    parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
+                        help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor FDR que la alcance.")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
@@ -270,17 +274,19 @@ def main() -> None:
     val_criterion = nn.BCEWithLogitsLoss()
 
     # Loop de entrenamiento con early stopping si no mejora en X cantidad de épocas.
-    # El criterio de "mejor" es CLÍNICO, no el loss crudo: entre los umbrales con
-    # sensibilidad >= MIN_SENSITIVITY se elige el de MENOR falsos positivos por hora.
+    # El criterio de "mejor" es CLÍNICO y a nivel EVENTO, no el loss crudo: entre los
+    # umbrales cuya sensibilidad de CRISIS >= MIN_EVENT_SENSITIVITY se elige el de
+    # MENOR FDR (falsas detecciones / hora). Ver PLAN_MVP §3.7.2.
     best_val_loss = float("inf")   # solo de referencia (se sigue guardando en el log)
-    best_fp_per_hour = float("inf")
+    best_fdr = float("inf")
     best_epoch = 0
     patience_left = args.patience
     start = time.time()
     history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
 
     print(f"\n=== Entrenamiento ({args.epochs} épocas máx.) ===")
-    print(f"Criterio de selección: menor fp/h con sens >= {args.min_sensitivity}")
+    print(f"Criterio de selección: menor FDR con sens de crisis >= {args.min_event_sensitivity}")
+    print(f"La tabla de abajo es a nivel VENTANA @ umbral {THRESHOLD} (solo referencia).")
     print(f"{'Ep':>3} | {'train_loss':>12} | {'val_loss':>12} | {'sens':>10} | {'spec':>10} | "
           f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
 
@@ -292,56 +298,71 @@ def main() -> None:
         train_loss = train_one_epoch(model, train_loader, train_criterion, optimizer, device)
         val_loss, probs, labels = evaluate(model, val_loader, val_criterion, device)
 
-        # métricas por ventana a umbral fijo (para la tabla) + curva sens <-> fp/h
+        # métricas por ventana a umbral fijo (para la tabla) + curva sens <-> fp/h (referencia)
         m = binary_metrics(probs, labels, THRESHOLD)
         curve = threshold_sweep(probs, labels)
-        op = select_operating_point(curve, args.min_sensitivity)
 
-        if op is not None:
-            op_fp_per_hour = op["false_positive_per_hour"]
-            op_sensibility = op["sensibility"]
-            op_threshold = op["threshold"]
+        # --- PUNTO DE OPERACIÓN A NIVEL EVENTO (criterio clínico de selección) ---
+        # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR FDR.
+        op_ev, op_threshold = select_event_operating_point(
+            probs, labels,
+            file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
+            valid_files=val_ds._valid_files, annotations=val_ds.annotations,
+            min_sensibility=args.min_event_sensitivity,
+            n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
+            min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
+        )
+
+        if op_ev is not None:
+            ev = op_ev
+            op_fdr = op_ev["false_detection_per_hour"]
+            op_sensibility = op_ev["sensibility"]
+            warn_msg = None
         else:
-            # ningún umbral alcanza el objetivo de sensibilidad -> no hay punto de
-            # operación; para las métricas event-based usamos el de mayor sensibilidad.
-            op_threshold = max(curve, key=lambda r: r["sensibility"])["threshold"]
-            op_fp_per_hour = float("inf")
-            op_sensibility = max(r["sensibility"] for r in curve)
-            print(f"     [WARN] ningún umbral alcanzó sens >= {args.min_sensitivity} "
-                  f"(máx sens lograda: {op_sensibility:.3f} @ umbral {op_threshold:.2f})")
+            # ningún umbral alcanza el objetivo de sensibilidad de CRISIS -> fallback:
+            # mostramos el umbral con la MÁXIMA sensibilidad de crisis alcanzable, y
+            # marcamos FDR=inf para que este modelo NO pueda ser seleccionado.
+            ev = None
+            for _t in np.arange(0.05, 1.0, 0.05):
+                _e = event_metrics(probs, labels,
+                                   file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
+                                   valid_files=val_ds._valid_files, annotations=val_ds.annotations,
+                                   threshold=_t,
+                                   n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
+                                   min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
+                                   max_latency=EVENT_MAX_LATENCY)
+                if ev is None or _e["sensibility"] > ev["sensibility"]:
+                    ev = _e
+                    op_threshold = float(_t)
+            op_fdr = float("inf")
+            op_sensibility = ev["sensibility"]
+            warn_msg = (f"ningún umbral alcanzó sens de crisis >= {args.min_event_sensitivity} "
+                        f"(máximo logrado: {op_sensibility:.3f} @ umbral {op_threshold:.2f})")
 
-        # trade-off sens <-> fp/h a lo largo de los umbrales: para cada sens objetivo,
-        # el menor fp/h que la alcanza (y con qué umbral). Sirve para ver si vale la
-        # pena exigir más sensibilidad o si el costo en falsas alarmas se dispara.
+        # trade-off sens <-> fp/h a lo largo de los umbrales (nivel VENTANA, solo
+        # referencia): para cada sens objetivo, el menor fp/h que la alcanza.
         _levels = (0.5, 0.6, 0.7, 0.8, 0.9)
         _trade = []
         for _lv in _levels:
             _o = select_operating_point(curve, _lv)
-            if _o is None:
-                _trade.append(f"sens>={_lv}: --")
-            else:
-                _trade.append(
-                    f"sens>={_lv}: {_o['false_positive_per_hour']:.1f} fp/h @ {_o['threshold']:.2f}"
-                )
-        print("     trade-off fp/h por sens objetivo:  " + "  |  ".join(_trade))
-
-        # métricas a nivel EVENTO (crisis) con el postprocesado n-en-N
-        ev = event_metrics(probs, labels,
-                           file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
-                           valid_files=val_ds._valid_files, annotations=val_ds.annotations,
-                           threshold=op_threshold,
-                           n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
-                           min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
-                           max_latency=EVENT_MAX_LATENCY)
+            _trade.append("--" if _o is None else f"{_o['false_positive_per_hour']:.1f} fp/h @ {_o['threshold']:.2f}")
 
         elapsed_time_for_epoch = time.time() - t_epoch
+
+        # --- log por época ---
         print(f"{epoch:>3} | {train_loss:>12.6f} | {val_loss:>12.6f} | "
               f"{m['sensibility']:>10.4f} | {m['specificity']:>10.4f} | {m['false_positive_rate']:>10.4f} | "
               f"{m['false_positive_per_hour']:>10.4f} | {m['accuracy']:>10.4f} | {elapsed_time_for_epoch:>7.1f}s")
-        print(f"     OP(umbral={op_threshold:.2f}): sens={op_sensibility:.3f}  fp/h={op_fp_per_hour:.3f}  "
-              f"F1={m['f1']:.3f}  MCC={m['mcc']:.3f}")
-        print(f"     EVENTO: sens={ev['sensibility']:.3f}  FDR={ev['false_detection_per_hour']:.3f}/h  "
-              f"latencia={ev['latency_mean']:.1f}s ({ev['n_detected']}/{ev['n_seizures']} crisis)")
+        print(f"      ventana @ {THRESHOLD:.2f} : sens={m['sensibility']:.3f}  spec={m['specificity']:.3f}  "
+              f"fp/h={m['false_positive_per_hour']:.1f}  F1={m['f1']:.3f}  MCC={m['mcc']:.3f}")
+        print(f"      evento  @ {op_threshold:.2f} : sens={op_sensibility:.3f} "
+              f"({ev['n_detected']}/{ev['n_seizures']} crisis)  FDR={ev['false_detection_per_hour']:.1f}/h  "
+              f"latencia={ev['latency_mean']:.1f}s")
+        print(f"      trade-off (ventana):  sens>=0.5 -> {_trade[0]}   >=0.6 -> {_trade[1]}   "
+              f">=0.7 -> {_trade[2]}   >=0.8 -> {_trade[3]}   >=0.9 -> {_trade[4]}")
+        if warn_msg is not None:
+            print(f"      [WARN] {warn_msg}")
+        print()
 
         history.append({
             "epoch": epoch,
@@ -356,17 +377,17 @@ def main() -> None:
             "mcc": m["mcc"],
             "op_threshold": op_threshold,
             "op_sensibility": op_sensibility,
-            "op_fp_per_hour": op_fp_per_hour,
+            "op_fdr_per_hour": op_fdr,
             "event_sensibility": ev["sensibility"],
             "event_fdr_per_hour": ev["false_detection_per_hour"],
             "event_latency_mean": ev["latency_mean"],
             "time_s": elapsed_time_for_epoch,
         })
 
-        # si el punto de operación mejoró (menor fp/h con sens >= objetivo), guardo el checkpoint
-        improved = op is not None and op_fp_per_hour < best_fp_per_hour
+        # si el punto de operación EVENTO mejoró (menor FDR con sens de crisis >= objetivo)
+        improved = op_ev is not None and op_fdr < best_fdr
         if improved:
-            best_fp_per_hour = op_fp_per_hour
+            best_fdr = op_fdr
             best_val_loss = val_loss
             best_epoch = epoch
             patience_left = args.patience
@@ -375,20 +396,20 @@ def main() -> None:
                 epoch=epoch, best_val_loss=best_val_loss,
                 pos_weight=pos_weight, seed=args.seed,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
-                op_fp_per_hour=op_fp_per_hour,
+                op_fdr_per_hour=op_fdr,
             )
-            print(f"    -> mejor punto de operación: sens={op_sensibility:.3f}, "
-                  f"fp/h={op_fp_per_hour:.3f} @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
+            print(f"    -> mejor punto de operación (evento): sens={op_sensibility:.3f}, "
+                  f"FDR={op_fdr:.3f}/h @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping: no mejoró el fp/h (sens >= {args.min_sensitivity}) en "
-                      f"{args.patience} épocas. Cortando.")
+                print(f"Early stopping: no mejoró el FDR (sens de crisis >= {args.min_event_sensitivity}) "
+                      f"en {args.patience} épocas. Cortando.")
                 break
 
     total_time = time.time() - start
     print(f"\n=== Fin del entrenamiento ===")
-    print(f"Mejor época (por fp/h con sens >= {args.min_sensitivity}): {best_epoch}")
+    print(f"Mejor época (por menor FDR con sens de crisis >= {args.min_event_sensitivity}): {best_epoch}")
     print(f"  val_loss de esa época: {best_val_loss:.6f}")
     print(f"Tiempo total: {total_time / 60:.1f} min")
     print(f"Checkpoint: {args.out}")
@@ -401,7 +422,8 @@ def main() -> None:
         "history": history,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
-        "best_fp_per_hour": best_fp_per_hour,
+        "best_fdr_per_hour": best_fdr,
+        "min_event_sensitivity": args.min_event_sensitivity,
         "min_sensitivity": args.min_sensitivity,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,

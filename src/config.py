@@ -104,9 +104,15 @@ DROPOUT = 0.4 #en cada lote apaga al 40% de las neuronas al azar, así no se sob
 #treshold, se considera q la red predijo crisis. Es ajustable para priorizar sensibilidad o especificidad
 THRESHOLD = 0.9
 
-# Sensibilidad objetivo para elegir el PUNTO DE OPERACIÓN: entre todos los umbrales
-# con sensibilidad >= este valor, se elige el de MENOR falsos positivos por hora.
-MIN_SENSITIVITY = 0.85
+# Sensibilidad objetivo (a nivel VENTANA) usada SOLO para el display/curva, no para
+# elegir el modelo. Sirve para marcar un punto de referencia sobre la curva sens <-> fp/h.
+MIN_SENSITIVITY = 0.5
+
+# Sensibilidad objetivo a nivel EVENTO (crisis): criterio con el que se elige el
+# mejor checkpoint. Entre todos los umbrales cuya sensibilidad de CRISIS >= este
+# valor, se elige el de MENOR FDR (falsas detecciones / hora). Es la métrica clínica
+# relevante (ver PLAN_MVP §3.7.2).
+MIN_EVENT_SENSITIVITY = 0.9
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
 # dispara una alarma si hay >= EVENT_N_WITHIN predicciones positivas dentro de las últimas EVENT_N_WINDOW ventanas consecutivas.

@@ -201,3 +201,37 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         "n_false_alarms": n_false_alarms,
         "total_hours": total_hours,
     }
+
+
+def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
+                                 min_sensibility: float, n_within: int = 3, n_window: int = 4,
+                                 min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                                 thresholds=None) -> tuple[dict | None, float | None]:
+    """
+    Punto de operación a nivel EVENTO: entre los umbrales cuya sensibilidad de CRISIS
+    >= `min_sensibility`, el de MENOR FDR (falsas detecciones / hora).
+
+    Recorre la misma malla de umbrales que `threshold_sweep`, evalúa cada uno con
+    `event_metrics` y se queda con el mejor (menor FDR) que cumpla el objetivo de
+    sensibilidad de crisis.
+
+    Devuelve (event_metrics, threshold) del punto elegido, o (None, None) si ningún
+    umbral alcanza el objetivo de sensibilidad a nivel evento.
+    """
+    probs = np.asarray(probs).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    if thresholds is None:
+        thresholds = np.arange(0.05, 1.0, 0.05)
+
+    best: dict | None = None
+    best_threshold: float | None = None
+    for t in thresholds:
+        ev = event_metrics(probs, labels, file_ids=file_ids, local_ids=local_ids,
+                           valid_files=valid_files, annotations=annotations, threshold=t,
+                           n_within=n_within, n_window=n_window,
+                           min_alarm_interval=min_alarm_interval, max_latency=max_latency)
+        if ev["sensibility"] >= min_sensibility:
+            if best is None or ev["false_detection_per_hour"] < best["false_detection_per_hour"]:
+                best = ev
+                best_threshold = float(t)
+    return best, best_threshold
