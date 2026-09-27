@@ -103,6 +103,19 @@ DROPOUT = 0.4 #en cada lote apaga al 40% de las neuronas al azar, así no se sob
 #la red no devuelve un sí o un no, sino un valor entre 0 y 1, q es la probabilidad de q haya crisis. Si la probabilidad es mayor al
 #treshold, se considera q la red predijo crisis. Es ajustable para priorizar sensibilidad o especificidad
 THRESHOLD = 0.9
+
+# Sensibilidad objetivo para elegir el PUNTO DE OPERACIÓN: entre todos los umbrales
+# con sensibilidad >= este valor, se elige el de MENOR falsos positivos por hora.
+MIN_SENSITIVITY = 0.85
+
+# Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
+# dispara una alarma si hay >= EVENT_N_WITHIN predicciones positivas dentro de las últimas EVENT_N_WINDOW ventanas consecutivas.
+EVENT_N_WITHIN = 3
+EVENT_N_WINDOW = 4
+# Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
+EVENT_MIN_ALARM_INTERVAL = 30.0
+# Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].
+EVENT_MAX_LATENCY = 30.0
 #--------------------------------------------------------------------------------------------------------------------
 # Workers del DataLoader (0 = proceso único)
 NUM_WORKERS = 0

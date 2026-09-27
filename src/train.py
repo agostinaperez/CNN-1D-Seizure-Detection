@@ -35,9 +35,13 @@ from src.config import (
     DATASET_DIR,
     DROPOUT,
     EPOCHS,
+    EVENT_MAX_LATENCY,
+    EVENT_MIN_ALARM_INTERVAL,
+    EVENT_N_WINDOW,
+    EVENT_N_WITHIN,
     FC_UNITS,
-    FS,
     LEARNING_RATE,
+    MIN_SENSITIVITY,
     MODELS_DIR,
     N_CHANNELS,
     NEG_POS_RATIO,
@@ -46,12 +50,11 @@ from src.config import (
     SCALER_STATS_FILE,
     SEED,
     SPLIT_FILE,
-    STRIDE_SAMPLES,
     THRESHOLD,
     WEIGHT_DECAY,
-    WIN_SECONDS,
 )
 from src.data import build_splits_dataloaders, compute_positive_weight
+from src.metrics import binary_metrics, event_metrics, select_operating_point, threshold_sweep
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
 
@@ -154,58 +157,21 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
     return total_loss / n_seen, probs, labels
 
 
-def binary_metrics(probs: torch.Tensor, labels: torch.Tensor, threshold: float) -> dict:
-    """
-    Métricas clínicas de clasificación binaria sobre TODAS las ventanas de un
-    split (val o test), usando el umbral de decisión.
-
-    Terminología:
-      - Sensibilidad (Recall) = qué tan bien detecta crisis.
-      - Especificidad          = qué tan bien descarta normal.
-      - FPR (tasa)             = 1 - Especificidad (fracción de negativas marcadas como crisis).
-      - FP/hora                = falsos positivos por hora de grabación (conteo / horas).
-      - Accuracy               = (actual_positive + actual_negative) / total.
-    """
-    pred = (probs >= threshold).float()  # aplica el umbral -> rótulo binario
-    # Matriz de confusión en conteos:
-    actual_positive = int(((pred == 1) & (labels == 1)).sum())  # TP: crisis bien detectada
-    false_positive = int(((pred == 1) & (labels == 0)).sum())   # FP: alarma falsa
-    actual_negative = int(((pred == 0) & (labels == 0)).sum())  # TN: normal bien descartada
-    false_negative = int(((pred == 0) & (labels == 1)).sum())   # FN: crisis no detectada
-
-    # Horas de grabación cubiertas por las ventanas del split
-    # las ventanas solapan 50%, así que cada ventana NUEVA aporta solo STRIDE_SAMPLES muestras de señal (no WIN_SAMPLES). Si usara
-    # n_windows * WIN_SAMPLES estaría contando el doble de tiempo y el fp/h saldría la mitad del valor real.
-    n_windows = int(labels.numel())
-    # span_seconds = tiempo entre el inicio de la 1er ventana y el fin de la última.
-    span_seconds = (n_windows - 1) * (STRIDE_SAMPLES / FS) + WIN_SECONDS if n_windows > 0 else 0.0
-    total_hours = span_seconds / 3600.0
-
-    total = actual_positive + false_positive + actual_negative + false_negative
-    return {
-        "sensibility": actual_positive / (actual_positive + false_negative) if (actual_positive + false_negative) > 0 else 0.0,
-        "specificity": actual_negative / (actual_negative + false_positive) if (actual_negative + false_positive) > 0 else 0.0,
-        # TASA de falsos positivos: fracción de las negativas marcadas como crisis. 1-specificity
-        "false_positive_rate": false_positive / (false_positive + actual_negative) if (false_positive + actual_negative) > 0 else 0.0,
-        # Falsos positivos POR HORA: conteo real normalizado por tiempo de grabación. métrica clínica estándar en detección de crisis
-        "false_positive_per_hour": false_positive / total_hours if total_hours > 0 else 0.0,
-        "accuracy": (actual_positive + actual_negative) / total if total > 0 else 0.0,
-        # Conteos crudos
-        "actual_positive": actual_positive, "false_positive": false_positive, "actual_negative": actual_negative, "false_negative": false_negative,
-    }
-
-
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
-                    epoch: int, best_val_loss: float, pos_weight: float, seed: int) -> None:
+                    epoch: int, best_val_loss: float, pos_weight: float, seed: int,
+                    op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
+                    op_fp_per_hour: float = float("inf")) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar:
 
       - model_state_dict: los valores de TODOS los pesos (la "memoria" aprendida);
       - config del modelo: listas de canales/kernels, fc_units, dropout, etc. (para reconstruir la arquitectura idéntica al cargar);
       - scaler_stats: mediana/IQR por canal del RobustScaler (para que inference escale las ventanas nuevas EXACTAMENTE igual que en train);
-      - metadata: época, best_val_loss, pos_weight, seed (auditoría).
+      - metadata: época, best_val_loss, pos_weight, seed (auditoría);
+      - op_*: punto de operación elegido en val (umbral, sensibilidad y fp/h).
 
-    Se guarda en disco el momento exacto en que el loss de validación fue mínimo
+    Se guarda en disco el momento en que el criterio clínico (menor fp/h con sens
+    >= objetivo) fue el mejor, no el loss crudo.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -223,6 +189,9 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
             "iqr": scaler_stats["iqr"],
         },
         "threshold": THRESHOLD,
+        "op_threshold": op_threshold,
+        "op_sensibility": op_sensibility,
+        "op_fp_per_hour": op_fp_per_hour,
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
@@ -245,6 +214,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=PATIENCE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
+    parser.add_argument("--min-sensitivity", type=float, default=MIN_SENSITIVITY,
+                        help="Sensibilidad objetivo: se elige el umbral con menor fp/h que la alcance.")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
@@ -268,6 +239,7 @@ def main() -> None:
     #solo uso esto para tener info del dataset e imprimirlo. Sino uso el dataloader
     train_ds = loaders["train"]["dataset"]
     train_loader = loaders["train"]["dataloader"]
+    val_ds = loaders["val"]["dataset"]
     val_loader = loaders["val"]["dataloader"]
 
     pos_weight = compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
@@ -297,14 +269,18 @@ def main() -> None:
     # Loss de VALIDACIÓN. Independientemente si en la función de pérdida usé o no el pos_weight, acá NO lo uso. Necesito saber si la red generaliza, de forma estable
     val_criterion = nn.BCEWithLogitsLoss()
 
-    # Loop de entrenamiento con early stopping si no mejora en X cantidad de épocas
-    best_val_loss = float("inf")  # cualquier pérdida inicial mejora
+    # Loop de entrenamiento con early stopping si no mejora en X cantidad de épocas.
+    # El criterio de "mejor" es CLÍNICO, no el loss crudo: entre los umbrales con
+    # sensibilidad >= MIN_SENSITIVITY se elige el de MENOR falsos positivos por hora.
+    best_val_loss = float("inf")   # solo de referencia (se sigue guardando en el log)
+    best_fp_per_hour = float("inf")
     best_epoch = 0
     patience_left = args.patience
     start = time.time()
     history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
 
     print(f"\n=== Entrenamiento ({args.epochs} épocas máx.) ===")
+    print(f"Criterio de selección: menor fp/h con sens >= {args.min_sensitivity}")
     print(f"{'Ep':>3} | {'train_loss':>12} | {'val_loss':>12} | {'sens':>10} | {'spec':>10} | "
           f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
 
@@ -315,12 +291,57 @@ def main() -> None:
         #NI DROPOUT. O SEA VAL LOSS ME DICE Q TAN BIEN GENERALIZÓ EN PROMEDIO FRENTE A DATOS CON LOS Q NO ENTRENÉ
         train_loss = train_one_epoch(model, train_loader, train_criterion, optimizer, device)
         val_loss, probs, labels = evaluate(model, val_loader, val_criterion, device)
+
+        # métricas por ventana a umbral fijo (para la tabla) + curva sens <-> fp/h
         m = binary_metrics(probs, labels, THRESHOLD)
+        curve = threshold_sweep(probs, labels)
+        op = select_operating_point(curve, args.min_sensitivity)
+
+        if op is not None:
+            op_fp_per_hour = op["false_positive_per_hour"]
+            op_sensibility = op["sensibility"]
+            op_threshold = op["threshold"]
+        else:
+            # ningún umbral alcanza el objetivo de sensibilidad -> no hay punto de
+            # operación; para las métricas event-based usamos el de mayor sensibilidad.
+            op_threshold = max(curve, key=lambda r: r["sensibility"])["threshold"]
+            op_fp_per_hour = float("inf")
+            op_sensibility = max(r["sensibility"] for r in curve)
+            print(f"     [WARN] ningún umbral alcanzó sens >= {args.min_sensitivity} "
+                  f"(máx sens lograda: {op_sensibility:.3f} @ umbral {op_threshold:.2f})")
+
+        # trade-off sens <-> fp/h a lo largo de los umbrales: para cada sens objetivo,
+        # el menor fp/h que la alcanza (y con qué umbral). Sirve para ver si vale la
+        # pena exigir más sensibilidad o si el costo en falsas alarmas se dispara.
+        _levels = (0.5, 0.6, 0.7, 0.8, 0.9)
+        _trade = []
+        for _lv in _levels:
+            _o = select_operating_point(curve, _lv)
+            if _o is None:
+                _trade.append(f"sens>={_lv}: --")
+            else:
+                _trade.append(
+                    f"sens>={_lv}: {_o['false_positive_per_hour']:.1f} fp/h @ {_o['threshold']:.2f}"
+                )
+        print("     trade-off fp/h por sens objetivo:  " + "  |  ".join(_trade))
+
+        # métricas a nivel EVENTO (crisis) con el postprocesado n-en-N
+        ev = event_metrics(probs, labels,
+                           file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
+                           valid_files=val_ds._valid_files, annotations=val_ds.annotations,
+                           threshold=op_threshold,
+                           n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
+                           min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
+                           max_latency=EVENT_MAX_LATENCY)
 
         elapsed_time_for_epoch = time.time() - t_epoch
         print(f"{epoch:>3} | {train_loss:>12.6f} | {val_loss:>12.6f} | "
               f"{m['sensibility']:>10.4f} | {m['specificity']:>10.4f} | {m['false_positive_rate']:>10.4f} | "
               f"{m['false_positive_per_hour']:>10.4f} | {m['accuracy']:>10.4f} | {elapsed_time_for_epoch:>7.1f}s")
+        print(f"     OP(umbral={op_threshold:.2f}): sens={op_sensibility:.3f}  fp/h={op_fp_per_hour:.3f}  "
+              f"F1={m['f1']:.3f}  MCC={m['mcc']:.3f}")
+        print(f"     EVENTO: sens={ev['sensibility']:.3f}  FDR={ev['false_detection_per_hour']:.3f}/h  "
+              f"latencia={ev['latency_mean']:.1f}s ({ev['n_detected']}/{ev['n_seizures']} crisis)")
 
         history.append({
             "epoch": epoch,
@@ -331,11 +352,21 @@ def main() -> None:
             "false_positive_rate": m["false_positive_rate"],
             "false_positive_per_hour": m["false_positive_per_hour"],
             "accuracy": m["accuracy"],
+            "f1": m["f1"],
+            "mcc": m["mcc"],
+            "op_threshold": op_threshold,
+            "op_sensibility": op_sensibility,
+            "op_fp_per_hour": op_fp_per_hour,
+            "event_sensibility": ev["sensibility"],
+            "event_fdr_per_hour": ev["false_detection_per_hour"],
+            "event_latency_mean": ev["latency_mean"],
             "time_s": elapsed_time_for_epoch,
         })
 
-        #si val_loss mejoró, guardo el checkpoint y reseteo paciencia
-        if val_loss < best_val_loss:
+        # si el punto de operación mejoró (menor fp/h con sens >= objetivo), guardo el checkpoint
+        improved = op is not None and op_fp_per_hour < best_fp_per_hour
+        if improved:
+            best_fp_per_hour = op_fp_per_hour
             best_val_loss = val_loss
             best_epoch = epoch
             patience_left = args.patience
@@ -343,17 +374,22 @@ def main() -> None:
                 Path(args.out), model, scaler_stats,
                 epoch=epoch, best_val_loss=best_val_loss,
                 pos_weight=pos_weight, seed=args.seed,
+                op_threshold=op_threshold, op_sensibility=op_sensibility,
+                op_fp_per_hour=op_fp_per_hour,
             )
-            print(f"    -> mejor val_loss={best_val_loss:.6f}, checkpoint guardado en {args.out}")
+            print(f"    -> mejor punto de operación: sens={op_sensibility:.3f}, "
+                  f"fp/h={op_fp_per_hour:.3f} @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping: val_loss no mejoró en {args.patience} épocas. Cortando.")
+                print(f"Early stopping: no mejoró el fp/h (sens >= {args.min_sensitivity}) en "
+                      f"{args.patience} épocas. Cortando.")
                 break
 
     total_time = time.time() - start
     print(f"\n=== Fin del entrenamiento ===")
-    print(f"Mejor val_loss: {best_val_loss:.6f}")
+    print(f"Mejor época (por fp/h con sens >= {args.min_sensitivity}): {best_epoch}")
+    print(f"  val_loss de esa época: {best_val_loss:.6f}")
     print(f"Tiempo total: {total_time / 60:.1f} min")
     print(f"Checkpoint: {args.out}")
 
@@ -365,6 +401,8 @@ def main() -> None:
         "history": history,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
+        "best_fp_per_hour": best_fp_per_hour,
+        "min_sensitivity": args.min_sensitivity,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,
         "seed": args.seed,
