@@ -83,7 +83,7 @@ SPLIT_W_ZSEC = 2.0
 # Hiperparámetros de entrenamiento:-----------------------------------------------------------------------
 
 #learning rate inicial. Yo uso optimizador AdamW por ende el learning rate es de tasa adaptativa, el de cada peso se va recalculando y ajustando
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 1e-4
 # Weight decay del AdamW: penaliza pesos grandes (regularización L2). En AdamW se aplica "desacoplado" del momento adaptativo (a diferencia del Adam clásico)
 # 1e-2 es el default de PyTorch; se puede bajar a 1e-4 si se nota underfitting.
 WEIGHT_DECAY = 1e-2

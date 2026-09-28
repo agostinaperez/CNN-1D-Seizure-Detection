@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -223,7 +224,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
+    parser.add_argument("--backup-dir", type=str, default=None,
+                        help="Carpeta espejo (ej. Google Drive montado) donde copiar el checkpoint y el historial cada vez que mejoran. Si Colab se cierra, el mejor modelo queda acá.")
     return parser.parse_args()
+
+
+def backup_file(src: Path, backup_dir: str | None) -> None:
+    """Copia `src` a `backup_dir` (creándola si hace falta), sin romper el
+    entrenamiento si la copia falla (Drive montado puede cortarse)."""
+    if not backup_dir:
+        return
+    try:
+        dst_dir = Path(backup_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / src.name
+        shutil.copy2(src, dst)
+        print(f"    [backup] copiado a {dst}")
+    except Exception as exc:  # no queremos que una falla de Drive mate la corrida
+        print(f"    [backup][WARN] no se pudo copiar {src.name} a {backup_dir}: {exc}")
 
 
 def main() -> None:
@@ -398,6 +416,7 @@ def main() -> None:
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
             )
+            backup_file(Path(args.out), args.backup_dir)
             print(f"    -> mejor punto de operación (evento): sens={op_sensibility:.3f}, "
                   f"FDR={op_fdr:.3f}/h @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
         else:
@@ -430,6 +449,7 @@ def main() -> None:
         "seed": args.seed,
     }, indent=2), encoding="utf-8")
     print(f"Historial de entrenamiento: {history_path}")
+    backup_file(history_path, args.backup_dir)
 
 
 if __name__ == "__main__":

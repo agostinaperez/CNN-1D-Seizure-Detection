@@ -334,7 +334,7 @@ def compute_positive_weight(dataset: WindowDataset, neg_pos_ratio: int | float =
     if dataset.n_positive == 0:
         return 1.0
     # Peso coherente con el undersampling: coincide con el ratio efectivo.
-    return float(neg_pos_ratio)
+    return float(neg_pos_ratio/2)
 
 
 # Construcción de Dataset + DataLoader por split
