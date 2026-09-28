@@ -84,6 +84,11 @@ SPLIT_W_ZSEC = 2.0
 
 #learning rate inicial. Yo uso optimizador AdamW por ende el learning rate es de tasa adaptativa, el de cada peso se va recalculando y ajustando
 LEARNING_RATE = 1e-4
+# Clip de gradiente (norma L2 máxima): corta pasos gigantes que hacen que el modelo
+# "enloquezca" y prediga todo positivo en algunas épocas (la oscilación valiente/cobarde).
+GRAD_CLIP = 1.0
+# learning rate mínimo del scheduler coseno (se alcanza al final del entrenamiento).
+LR_MIN = 0.0
 # Weight decay del AdamW: penaliza pesos grandes (regularización L2). En AdamW se aplica "desacoplado" del momento adaptativo (a diferencia del Adam clásico)
 # 1e-2 es el default de PyTorch; se puede bajar a 1e-4 si se nota underfitting.
 WEIGHT_DECAY = 1e-2

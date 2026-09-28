@@ -41,7 +41,9 @@ from src.config import (
     EVENT_N_WINDOW,
     EVENT_N_WITHIN,
     FC_UNITS,
+    GRAD_CLIP,
     LEARNING_RATE,
+    LR_MIN,
     MIN_EVENT_SENSITIVITY,
     MIN_SENSITIVITY,
     MODELS_DIR,
@@ -115,6 +117,7 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, device: str)
         loss = criterion(logits.squeeze(-1), labels)  # calculo el loss! BCEWithLogits espera logits (B,) y target (B,)
        #acá recorro ese grafo de gradientes en orden inverso, se calculan los gradientes, y libero el grafo.
         loss.backward()                # calculo todos los gradientes de todos los pesos usando backpropagation
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # corta gradientes gigantes (estabilidad)
         optimizer.step()               # ACÁ el optimizador aplica la fórmula de AdamW y actualiza los pesos posta
 
         # loss.item() es el loss PROMEDIO del batch; lo multiplico por el tamaño para acumular la suma total y después promediar sobre todas las ventanas.
@@ -217,6 +220,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=PATIENCE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
+    parser.add_argument("--pos-weight", type=float, default=None,
+                        help="Peso de la clase positiva en el loss. Default: igual a NEG_POS_RATIO.")
     parser.add_argument("--min-sensitivity", type=float, default=MIN_SENSITIVITY,
                         help="Sensibilidad objetivo a nivel VENTANA (solo display/curva, no selecciona).")
     parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
@@ -264,7 +269,7 @@ def main() -> None:
     val_ds = loaders["val"]["dataset"]
     val_loader = loaders["val"]["dataloader"]
 
-    pos_weight = compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
+    pos_weight = args.pos_weight if args.pos_weight is not None else compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
 
     print(f"\nConfiguración de entrenamiento")
     print(f"Train: {len(train_ds)} ventanas ({train_ds.n_positive} positivas, "
@@ -282,6 +287,9 @@ def main() -> None:
     #entonces, acá creo el optimizador AdamW, le paso la lista de todos los pesos, el learning rate inicial, y el weight decay de cuánto achico los pesos.
     #NO HACE NADA TODAVÍA, solo lo creo!
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Scheduler coseno: el lr baja de `args.lr` a LR_MIN a lo largo del entrenamiento.
+    # Estabiliza las épocas finales (que es donde el modelo oscila entre valiente/cobarde).
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=LR_MIN)
 
    #La BCE mide el error de mi predicción con la fórmula L = −[ y·log(p) + (1−y)·log(1−p) ], con p la probabilidad de crisis q predije e y=0 o y=1 según si hay o no
    #la probabilidad p es básicamente la sigmoide de mis logits (los logits son la salida real de mi cnn, yo con la sigmoide q es 1/(1+e^(-logit)) lo llevo a p entre 0 y 1)
@@ -425,6 +433,8 @@ def main() -> None:
                 print(f"Early stopping: no mejoró el FDR (sens de crisis >= {args.min_event_sensitivity}) "
                       f"en {args.patience} épocas. Cortando.")
                 break
+
+        scheduler.step()  # baja el lr un escalón (coseno), sin importar si mejoró o no
 
     total_time = time.time() - start
     print(f"\n=== Fin del entrenamiento ===")
