@@ -69,7 +69,7 @@ SEED = 42
 
 # Split por paciente (inter-paciente, 70/30 proporcional)
 TEST_RATIO = 0.30
-N_VAL_PATIENTS = 2 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
+N_VAL_PATIENTS = 4 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
 
 # Peso relativo de los SEGUNDOS DE CRISIS frente a los ARCHIVOS en el reparto
 # codicioso del split. Los segundos de crisis determinan cuántas ventanas
@@ -97,7 +97,7 @@ BATCH_SIZE = 64
 # Máximo de épocas (una época = 1 pasada por todas las ventanas muestreadas).
 EPOCHS = 40
 # Early stopping: cortar si la pérdida de validación no mejora en 8 épocas.
-PATIENCE = 5
+PATIENCE = 8
 
 # Ratios de negative:positive en cada batch de train.Ej: 4 => 4 ventanas no-crisis por cada ventana de crisis.
 NEG_POS_RATIO = 4
