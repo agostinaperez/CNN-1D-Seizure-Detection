@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from src.annotations import load_annotations, parse_summary
+from src.annotations import files_for_patient, load_annotations
 from src.config import (
     BATCH_SIZE,
     DATASET_DIR,
@@ -45,19 +45,9 @@ from src.preprocessing import _solve_selection, label_windows, load_scaler_stats
 # Armado de listas de archivos
 def files_for_patients(data_dir: Path | str, patients: list[str]) -> list[Path]:
     """EDFs anotados (los del summary) para una lista de pacientes"""
-    data_dir = Path(data_dir)
     files: list[Path] = []
     for patient in patients:
-        summary = data_dir / patient / f"{patient}-summary.txt"
-        if not summary.exists():
-            print(f"[WARN] {patient}: no tiene summary; se omite.")
-            continue
-        for fname in parse_summary(summary):
-            path = data_dir / patient / fname
-            if path.exists():
-                files.append(path)
-            else:
-                print(f"[WARN] {patient}/{fname} anotado pero no existe en disco.")
+        files.extend(files_for_patient(data_dir, patient))
     return files
 
 
@@ -109,22 +99,29 @@ class WindowDataset(Dataset):
     # Índice global (solo cabeceras, sin cargar la señal)
     def _scan_header(self, path: Path) -> tuple[int, np.ndarray] | None:
         """(n_ventanas, labels) leyendo solo la cabecera del EDF."""
-        raw = mne.io.read_raw_edf(path, preload=False, verbose="ERROR")
-        fs = float(raw.info["sfreq"])
-        if abs(fs - FS) > 1e-6:
+        raw = None
+        try:
+            raw = mne.io.read_raw_edf(path, preload=False, verbose="ERROR")
+            fs = float(raw.info["sfreq"])
+            if abs(fs - FS) > 1e-6:
+                return None
+            names = [normalize_channel_name(c) for c in raw.ch_names]
+            if _solve_selection(names) is None:
+                return None
+            n_total = int(raw.n_times)
+            n_windows = (n_total - WIN_SAMPLES) // STRIDE_SAMPLES + 1
+            if n_windows <= 0:
+                return None
+
+            starts = np.arange(n_windows, dtype=np.int64) * STRIDE_SAMPLES
+            labels = label_windows(starts, n_windows, self.annotations.get(path.name, []), fs=FS)
+            return n_windows, labels
+        except Exception as exc:
+            print(f"[WARN] {path.parent.name}/{path.name}: no se pudo leer el header ({exc})")
             return None
-        names = [normalize_channel_name(c) for c in raw.ch_names]
-        if _solve_selection(names) is None:
-            return None
-        n_total = int(raw.n_times)
-        n_windows = (n_total - WIN_SAMPLES) // STRIDE_SAMPLES + 1
-        if n_windows <= 0:
-            return None
-        
-        # starts = arange(n_windows) * stride  (como en segment_windows)
-        starts = np.arange(n_windows, dtype=np.int64) * STRIDE_SAMPLES
-        labels = label_windows(starts, n_windows, self.annotations.get(path.name, []), fs=FS)
-        return n_windows, labels
+        finally:
+            if raw is not None:
+                raw.close()
 
     def _ensure_index(self) -> None:
         """Construye el índice global ventana -> (archivo, ventana local) y el vector de labels"""
@@ -215,6 +212,23 @@ class WindowDataset(Dataset):
     @property
     def n_positive(self) -> int:
         return int(self.positive_indices().shape[0])
+
+    @property
+    def file_ids(self) -> np.ndarray:
+        self._ensure_index()
+        assert self._file_ids is not None
+        return self._file_ids
+
+    @property
+    def local_ids(self) -> np.ndarray:
+        self._ensure_index()
+        assert self._local_ids is not None
+        return self._local_ids
+
+    @property
+    def valid_files(self) -> list[Path]:
+        self._ensure_index()
+        return self._valid_files
 
 
 # la clase que me arma un epoch de entrenamiento. Cada vez q lo recorro (con __iter__), decide qué ventanas entran,
@@ -330,11 +344,13 @@ class BalancedEpochDataset(IterableDataset):
 #el peso se calcula a partir del ratio que se está usando, para q tampoco me sobredetecte crisis
 # x ej ratio 3 -> pos_weight = 3  (cada crisis pesa 3x una normal en el loss)
 def compute_positive_weight(dataset: WindowDataset, neg_pos_ratio: int | float = NEG_POS_RATIO) -> float:
-    # Si el split no tiene ninguna crisis, el peso es irrelevante
+    # Si el split no tiene ninguna crisis, el peso es irrelevante.
     if dataset.n_positive == 0:
         return 1.0
-    # Peso coherente con el undersampling: coincide con el ratio efectivo.
-    return float(neg_pos_ratio)
+    n_neg = min(int(dataset.n_positive * neg_pos_ratio), len(dataset.negative_indices()))
+    # El peso debe reflejar la distribución realmente muestreada, no el ratio
+    # solicitado cuando el split no tiene suficientes negativos.
+    return float(n_neg / dataset.n_positive) if n_neg > 0 else 1.0
 
 
 # Construcción de Dataset + DataLoader por split
@@ -343,6 +359,12 @@ def make_dataloader(dataset: WindowDataset, *, balanced: bool, batch_size: int =
                     num_workers: int = NUM_WORKERS, neg_pos_ratio: int | float = NEG_POS_RATIO,
                     seed: int = SEED) -> DataLoader:
     """DataLoader de un Dataset. `balanced=True` usa BalancedEpochDataset; `balanced=False` recorre TODAS las ventanas en orden (val/test, distribución natural)."""
+    if batch_size <= 0:
+        raise ValueError("batch_size debe ser mayor que cero")
+    if num_workers < 0:
+        raise ValueError("num_workers no puede ser negativo")
+    if neg_pos_ratio < 0:
+        raise ValueError("neg_pos_ratio no puede ser negativo")
     if balanced:
         # La época vive en UN proceso: si hubiera varios workers, cada uno armaría SU propia época completa y el modelo vería datos
         # duplicados. Por eso fuerzo 0 acá

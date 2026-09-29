@@ -32,6 +32,8 @@ WIN_SECONDS = 5.12
 # Muestras por ventana: redondeamos HACIA ABAJO -> 1310 (par).
 # Ventaja del par: solapamiento 50% EXACTO (650/1310) y pooling sin restos.
 WIN_SAMPLES = int(FS * WIN_SECONDS)
+# Duración física real de las ventanas después del redondeo a muestras.
+WIN_SECONDS_EFFECTIVE = WIN_SAMPLES / FS
 
 # Muestras por ventana finales (usadas por todo el pipeline).
 WIN_SAMPLES_USED = WIN_SAMPLES
@@ -84,8 +86,9 @@ SPLIT_W_ZSEC = 2.0
 
 #learning rate inicial. Yo uso optimizador AdamW por ende el learning rate es de tasa adaptativa, el de cada peso se va recalculando y ajustando
 LEARNING_RATE = 1e-4
-# Clip de gradiente (norma L2 máxima): corta pasos gigantes que hacen que el modelo
-# "enloquezca" y prediga todo positivo en algunas épocas (la oscilación valiente/cobarde).
+# Clip de gradiente (saco la norma L2, sumando cada gradiente de la lista elevado al cuadrado, y sacando la raiz cuadrada del total): si la norma total es mayor a grad_clip, saco el factor
+#de escala -> factor = grad_clip / norma L2. A ese factor de escala lo multiplico x cada elemento de la lista de gradientes, para achicarlos proporcionalmente.
+#esto hace q no haga saltos como loco el gradiente y no se me desbalancee y me oscile tanto el modelo
 GRAD_CLIP = 1.0
 # learning rate mínimo del scheduler coseno (se alcanza al final del entrenamiento).
 LR_MIN = 0.0

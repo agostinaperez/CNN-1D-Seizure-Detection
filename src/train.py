@@ -84,6 +84,10 @@ def set_seed(seed: int) -> None:
 
 def get_device(requested: str | None) -> str:
     if requested:
+        if requested not in {"cpu", "cuda"}:
+            raise ValueError("device debe ser 'cpu' o 'cuda'")
+        if requested == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("Se solicitó cuda, pero CUDA no está disponible")
         return requested
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -124,6 +128,8 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, device: str)
         total_loss += loss.item() * windows.size(0)
         n_seen += windows.size(0)
 
+    if n_seen == 0:
+        raise RuntimeError("El DataLoader de entrenamiento no contiene ventanas.")
     return total_loss / n_seen
 
 
@@ -155,7 +161,10 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
         all_probs.append(torch.sigmoid(logits.squeeze(-1)).cpu())
         all_labels.append(labels.cpu()) #ídem
 
-    #concatena todos los tensores de cada batch y me deja un solo tensor. 
+    if n_seen == 0:
+        raise RuntimeError("El DataLoader de evaluación no contiene ventanas.")
+
+    # concatena todos los tensores de cada batch y me deja un solo tensor.
     probs = torch.cat(all_probs)
     labels = torch.cat(all_labels)
     #total_loss/n_seen = VAL LOSS
@@ -165,9 +174,14 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     epoch: int, best_val_loss: float, pos_weight: float, seed: int,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
-                    op_fdr_per_hour: float = float("inf")) -> None:
+                    op_fdr_per_hour: float = float("inf"),
+                    min_event_sensitivity: float = MIN_EVENT_SENSITIVITY) -> None:
     """
-    Guarda lo necesario para re-usar el modelo sin re-entrenar:
+    Guarda lo necesario para re-usar el modelo sin re-entrenar.
+
+    El payload contiene únicamente tensores y tipos primitivos. Esto permite
+    cargarlo con ``torch.load(..., weights_only=True)`` sin deserializar
+    objetos pickle arbitrarios.
 
       - model_state_dict: los valores de TODOS los pesos (la "memoria" aprendida);
       - config del modelo: listas de canales/kernels, fc_units, dropout, etc. (para reconstruir la arquitectura idéntica al cargar);
@@ -181,6 +195,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
+        "format_version": 2,
         "model_state_dict": model.state_dict(),
         "model_config": {
             "in_channels": N_CHANNELS,
@@ -191,13 +206,20 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         },
         "scaler_stats": {
             "channels": scaler_stats["channels"],
-            "median": scaler_stats["median"],
-            "iqr": scaler_stats["iqr"],
+            "median": torch.as_tensor(scaler_stats["median"], dtype=torch.float64).cpu(),
+            "iqr": torch.as_tensor(scaler_stats["iqr"], dtype=torch.float64).cpu(),
         },
         "threshold": THRESHOLD,
         "op_threshold": op_threshold,
         "op_sensibility": op_sensibility,
         "op_fdr_per_hour": op_fdr_per_hour,
+        "event_config": {
+            "n_within": EVENT_N_WITHIN,
+            "n_window": EVENT_N_WINDOW,
+            "min_alarm_interval": EVENT_MIN_ALARM_INTERVAL,
+            "max_latency": EVENT_MAX_LATENCY,
+            "min_event_sensitivity": min_event_sensitivity,
+        },
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
@@ -231,7 +253,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
     parser.add_argument("--backup-dir", type=str, default=None,
                         help="Carpeta espejo (ej. Google Drive montado) donde copiar el checkpoint y el historial cada vez que mejoran. Si Colab se cierra, el mejor modelo queda acá.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.epochs <= 0:
+        parser.error("--epochs debe ser mayor que cero")
+    if args.batch_size <= 0:
+        parser.error("--batch-size debe ser mayor que cero")
+    if args.lr <= 0:
+        parser.error("--lr debe ser mayor que cero")
+    if args.weight_decay < 0:
+        parser.error("--weight-decay no puede ser negativo")
+    if args.patience <= 0:
+        parser.error("--patience debe ser mayor que cero")
+    if args.num_workers < 0:
+        parser.error("--num-workers no puede ser negativo")
+    if args.neg_pos_ratio <= 0:
+        parser.error("--neg-pos-ratio debe ser mayor que cero")
+    if args.pos_weight is not None and args.pos_weight <= 0:
+        parser.error("--pos-weight debe ser mayor que cero")
+    for name, value in (
+        ("--min-sensitivity", args.min_sensitivity),
+        ("--min-event-sensitivity", args.min_event_sensitivity),
+    ):
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"{name} debe estar entre 0 y 1")
+    if args.limit_files is not None and args.limit_files <= 0:
+        parser.error("--limit-files debe ser mayor que cero")
+    return args
 
 
 def backup_file(src: Path, backup_dir: str | None) -> None:
@@ -269,6 +316,15 @@ def main() -> None:
     val_ds = loaders["val"]["dataset"]
     val_loader = loaders["val"]["dataloader"]
 
+    if len(train_ds) == 0:
+        sys.exit("El split TRAIN no contiene ventanas procesables.")
+    if train_ds.n_positive == 0:
+        sys.exit("El split TRAIN no contiene ventanas positivas.")
+    if len(val_ds) == 0:
+        sys.exit("El split VAL no contiene ventanas procesables.")
+    if val_ds.n_positive == 0:
+        sys.exit("El split VAL no contiene ventanas positivas para seleccionar el punto de operación.")
+
     pos_weight = args.pos_weight if args.pos_weight is not None else compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
 
     print(f"\nConfiguración de entrenamiento")
@@ -288,7 +344,7 @@ def main() -> None:
     #NO HACE NADA TODAVÍA, solo lo creo!
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # Scheduler coseno: el lr baja de `args.lr` a LR_MIN a lo largo del entrenamiento.
-    # Estabiliza las épocas finales (que es donde el modelo oscila entre valiente/cobarde).
+    # Estabiliza las épocas finales (que es donde el modelo me oscila más)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=LR_MIN)
 
    #La BCE mide el error de mi predicción con la fórmula L = −[ y·log(p) + (1−y)·log(1−p) ], con p la probabilidad de crisis q predije e y=0 o y=1 según si hay o no
@@ -325,15 +381,26 @@ def main() -> None:
         val_loss, probs, labels = evaluate(model, val_loader, val_criterion, device)
 
         # métricas por ventana a umbral fijo (para la tabla) + curva sens <-> fp/h (referencia)
-        m = binary_metrics(probs, labels, THRESHOLD)
-        curve = threshold_sweep(probs, labels)
+        m = binary_metrics(
+            probs,
+            labels,
+            THRESHOLD,
+            file_ids=val_ds.file_ids,
+            local_ids=val_ds.local_ids,
+        )
+        curve = threshold_sweep(
+            probs,
+            labels,
+            file_ids=val_ds.file_ids,
+            local_ids=val_ds.local_ids,
+        )
 
         # --- PUNTO DE OPERACIÓN A NIVEL EVENTO (criterio clínico de selección) ---
         # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR FDR.
         op_ev, op_threshold = select_event_operating_point(
             probs, labels,
-            file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
-            valid_files=val_ds._valid_files, annotations=val_ds.annotations,
+            file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
+            valid_files=val_ds.valid_files, annotations=val_ds.annotations,
             min_sensibility=args.min_event_sensitivity,
             n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
             min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
@@ -351,8 +418,8 @@ def main() -> None:
             ev = None
             for _t in np.arange(0.05, 1.0, 0.05):
                 _e = event_metrics(probs, labels,
-                                   file_ids=val_ds._file_ids, local_ids=val_ds._local_ids,
-                                   valid_files=val_ds._valid_files, annotations=val_ds.annotations,
+                                   file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
+                                   valid_files=val_ds.valid_files, annotations=val_ds.annotations,
                                    threshold=_t,
                                    n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
                                    min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
@@ -423,6 +490,7 @@ def main() -> None:
                 pos_weight=pos_weight, seed=args.seed,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
+                min_event_sensitivity=args.min_event_sensitivity,
             )
             backup_file(Path(args.out), args.backup_dir)
             print(f"    -> mejor punto de operación (evento): sens={op_sensibility:.3f}, "

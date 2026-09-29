@@ -18,15 +18,30 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS
+from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
 
 
 def _span_hours(n_windows: int) -> float:
     """Horas cubiertas por `n_windows` ventanas solapadas al 50%."""
     if n_windows <= 0:
         return 0.0
-    span_seconds = (n_windows - 1) * (STRIDE_SAMPLES / FS) + WIN_SECONDS
+    span_seconds = (n_windows - 1) * (STRIDE_SAMPLES / FS) + WIN_SECONDS_EFFECTIVE
     return span_seconds / 3600.0
+
+
+def _span_hours_by_file(file_ids, local_ids) -> float:
+    """Suma la duración cubierta por las ventanas de cada EDF."""
+    file_ids = np.asarray(file_ids).reshape(-1)
+    local_ids = np.asarray(local_ids).reshape(-1)
+    if file_ids.shape != local_ids.shape:
+        raise ValueError("file_ids y local_ids deben tener la misma longitud")
+
+    total_hours = 0.0
+    for file_id in np.unique(file_ids):
+        file_windows = local_ids[file_ids == file_id]
+        if file_windows.size:
+            total_hours += _span_hours(int(file_windows.max()) + 1)
+    return total_hours
 
 
 def _counts(probs, labels, threshold: float) -> tuple[int, int, int, int]:
@@ -52,7 +67,7 @@ def _mcc(tp: int, fp: int, tn: int, fn: int) -> float:
     return (tp * tn - fp * fn) / denom if denom > 0 else 0.0
 
 
-def binary_metrics(probs, labels, threshold: float) -> dict:
+def binary_metrics(probs, labels, threshold: float, *, file_ids=None, local_ids=None) -> dict:
     """Métricas por VENTANA (segment-based) sobre la matriz de confusión.
     """
     probs = np.asarray(probs).reshape(-1)
@@ -61,7 +76,11 @@ def binary_metrics(probs, labels, threshold: float) -> dict:
     pos = tp + fn
     neg = fp + tn
     total = pos + neg
-    total_hours = _span_hours(int(labels.shape[0]))
+    total_hours = (
+        _span_hours_by_file(file_ids, local_ids)
+        if file_ids is not None and local_ids is not None
+        else _span_hours(int(labels.shape[0]))
+    )
     return {
         "sensibility": tp / pos if pos > 0 else 0.0,
         "specificity": tn / neg if neg > 0 else 0.0,
@@ -77,13 +96,17 @@ def binary_metrics(probs, labels, threshold: float) -> dict:
     }
 
 
-def threshold_sweep(probs, labels, thresholds=None) -> list[dict]:
+def threshold_sweep(probs, labels, thresholds=None, *, file_ids=None, local_ids=None) -> list[dict]:
     """Curva sensibilidad <-> fp/h barriendo umbrales. Una fila (dict) por umbral."""
     probs = np.asarray(probs).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
     if thresholds is None:
         thresholds = np.arange(0.05, 1.0, 0.05)
-    total_hours = _span_hours(int(labels.shape[0]))
+    total_hours = (
+        _span_hours_by_file(file_ids, local_ids)
+        if file_ids is not None and local_ids is not None
+        else _span_hours(int(labels.shape[0]))
+    )
     rows: list[dict] = []
     for t in thresholds:
         tp, fp, tn, fn = _counts(probs, labels, t)
@@ -138,7 +161,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
     local_ids = np.asarray(local_ids)
 
     pred = probs >= threshold
-    total_hours = _span_hours(int(labels.shape[0]))
+    total_hours = _span_hours_by_file(file_ids, local_ids)
 
     # 1) Alarmas por archivo (postprocesado sobre las predicciones en orden temporal).
     alarms_by_file: dict[int, list[float]] = {}
