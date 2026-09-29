@@ -20,7 +20,7 @@ import numpy as np
 import scipy.signal
 from sklearn.preprocessing import RobustScaler
 
-from src.annotations import load_annotations
+from src.annotations import files_for_patient, load_annotations
 from src.config import (
     CHANNELS_TUEV,
     DATASET_DIR,
@@ -36,7 +36,7 @@ from src.config import (
     STATS_WINDOW_STRIDE,
     STRIDE_SAMPLES,
     WIN_SAMPLES,
-    WIN_SECONDS,
+    WIN_SECONDS_EFFECTIVE,
 )
 
 # En EEG, cada canal mide una diferencia de potencial entre 2 electrodos.
@@ -90,7 +90,6 @@ def _solve_selection(normalized_edf_channels: list[str]) -> dict | None:
     #NO ME DEVUELVE LOS CANALES RECONSTRUIDOS PQ ESTO SE LLAMA EN VARIOS LUGARES
     #PERO SI ME DEVUELVE LAS INSTRUCCIONES DE COMO HACER ESA RECONSTRUCCION, ESO SERÍA MI PLAN
     plan: dict[str, tuple] = {}
-    mode = "direct" #valor inicial
     for channel_pair in VALID_CHANNELS:
         #el for corre 16 veces, uno x canal
         # Si el canal q quiero ya existe en este edf como bipolar directo, anoto en el plan q solo tomo su fila y listo.
@@ -100,27 +99,17 @@ def _solve_selection(normalized_edf_channels: list[str]) -> dict | None:
         
         # sino, se que para este EDF, a este canal lo reconstruyo por resta
         a, b = channel_pair.split("-")
-        #en la primer pasada entro acá, y defino q estructura tienen los canales a reconstruir de este archivo
-        if mode == "direct":
-            common_refs = [r for r in monopolares if a in monopolares[r] and b in monopolares[r]]
-            if a in unicos and b in unicos:        #electrodos únicos
-                mode = "single"
-            elif common_refs:                        # ref común (ej. CS2)
-                mode = f"ref:{common_refs[0]}"
-            else:
-                return None                          # no hay forma de armar el par
-
-        if mode == "single":
+        # Resolver cada canal de forma independiente permite montajes mixtos.
+        if a in unicos and b in unicos:
             # Resto: A - B usando los electrodos únicos.
-            if a not in unicos or b not in unicos:
-                return None
             plan[channel_pair] = ("diff", unicos[a], unicos[b])
         else:
             # Modo "ref:CS2": resto dos canales que comparten la MISMA ref.
             # FP1-F7 = (FP1-CS2) - (F7-CS2). La CS2 se cancela → queda FP1-F7.
-            ref = mode.split(":", 1)[1]
-            if ref not in monopolares or a not in monopolares[ref] or b not in monopolares[ref]:
+            common_refs = [r for r in monopolares if a in monopolares[r] and b in monopolares[r]]
+            if not common_refs:
                 return None
+            ref = common_refs[0]
             plan[channel_pair] = ("diff", monopolares[ref][a], monopolares[ref][b])
 
     return plan
@@ -137,11 +126,13 @@ def load_16_channels(path, fs_expected: int = FS) -> tuple[np.ndarray | None, st
     raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
     sampling_rate = float(raw.info["sfreq"])
     if abs(sampling_rate - fs_expected) > 1e-6:
+        raw.close()
         return None, f"sampling_rate_invalida ({sampling_rate:g} Hz != {fs_expected})"
 
     normalized_edf_channels = [normalize_channel_name(c) for c in raw.ch_names]
     plan = _solve_selection(normalized_edf_channels)
     if plan is None:
+        raw.close()
         return None, "channels_incompatible"
     
     #acá ejecuto el dichoso plan! 
@@ -165,15 +156,20 @@ def load_16_channels(path, fs_expected: int = FS) -> tuple[np.ndarray | None, st
             # La referencia se cancela, queda el canal bipolar puro
             #LA RESTA ES DE LA FILA COMPLETA, X ENDE ELEMENTO A ELEMENTO
             out[k] = data[op[1]] - data[op[2]]
+    raw.close()
     return out, None
 
 
 # Filtrado, ventaneo y etiquetado
 def filter_bandpass(data: np.ndarray, fs: int = FS, low: float = LOW_FREQ, high: float = HIGH_FREQ, order: int = FILTER_ORDER) -> np.ndarray:
     """
-    Butterworth pasa-banda con fase 0 para evitar distorsion temporal. Filtra a lo largo del eje 1  de cada canal.
+    Butterworth pasa-banda offline con fase 0 para evitar distorsion temporal.
+    Filtra a lo largo del eje 1 de cada canal.
     """
     
+    if fs <= 0 or order <= 0 or not 0 < low < high < fs / 2:
+        raise ValueError("Parámetros inválidos para el filtro pasabanda")
+
     #construyo la heramienta matemática para filtrar. especifico que es de tipo "bandpass",
     #pido q me lo devuelva en formato "sos" (second order sections) para que no me devuelva una única ecuación gigante.
     #pq, al final del día, el filtro es un polinomio de orden 5 en mi caso, entonces se puede hacer lío con los decimales
@@ -193,6 +189,9 @@ def segment_windows(data: np.ndarray, win_samples: int = WIN_SAMPLES, stride: in
     Devuelve (windows float32, indices_inicio en muestras).
     Sólo se emiten ventanas COMPLETAS: la sobra al final se descarta.
     """
+    if data.ndim != 2 or win_samples <= 0 or stride <= 0:
+        raise ValueError("Datos o parámetros de segmentación inválidos")
+
     n = data.shape[1] #me devuelve la cantidad de elementos que tengo en la dimensión temporal
     
     #calculo la cantidad de ventanas que tengo en este archivo. Tomo todas mis muestras, les resto la cantidad total de muestras por ventana (de ahí ya saco mi primer ventana, x eso el +1)
@@ -218,7 +217,7 @@ def segment_windows(data: np.ndarray, win_samples: int = WIN_SAMPLES, stride: in
     return windows, starts
 
 
-def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[int, int]], fs: int = FS, win_seconds: float = WIN_SECONDS) -> np.ndarray:
+def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[int, int]], fs: int = FS, win_seconds: float = WIN_SECONDS_EFFECTIVE) -> np.ndarray:
     """
     Etiqueta binaria: una ventana es CRISIS (1) si solapa cualquier porción de un intervalo de crisis anotado; si no, NO CRISIS (0).
     """
@@ -242,11 +241,14 @@ def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[i
 
 # Escalado robusto por canal
 def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tuple[int, int]]],
-                         scaler: str = SCALER, verbose: bool = True) -> dict:
+                          scaler: str = SCALER, verbose: bool = True) -> dict:
     """
     Recorre los archivos indicados, arma las ventanas filtradas y estima las estadísticas del RobustScaler por canal sobre TODAS esas ventanas:
     Devuelve un diccionario con las stats + el detalle de cuántos archivos/ventanas/puntos se usaron para estimar los cuantiles.
     """
+
+    if scaler != "robust":
+        raise ValueError(f"Scaler no soportado: {scaler!r}. Solo se admite 'robust'.")
 
     # guardar todas las muestras temporales de train es inviable, así q acumulo una VERSIÓN SUBMUESTREADA de las ventanas:
     #   - 1 de cada STATS_WINDOW_STRIDE ventanas,
@@ -272,6 +274,10 @@ def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tu
             continue
         
         windows = res["windows"]  # (n_ventanas, 16 canales, 1310 muestras)
+        if windows.shape[0] == 0:
+            if verbose:
+                print(f"   [skip] {path.parent.name}/{path.name}: sin ventanas completas")
+            continue
         # Submuestreo aleatorio: 1 de cada STATS_WINDOW_STRIDE ventanas al azar; dentro de cada ventana, 1 de cada STATS_SAMPLE_STRIDE muestras al azar (no es estratificado igual,
         # profe si llega a estar leyendo esto, no sé si debería hacerlo estratificado o no pero me parece que con que sea proporcionalmente 1/16 muestras al azar estoy bien)
         # Un muestreo uniforme aleatorio no sesga los cuantiles (mediana/IQR) pq es robusto!
@@ -317,7 +323,7 @@ def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tu
     del bloques, X  # libero las matrices gigantes y los bloques de la memoria
 
     stats = {
-        "scaler": "robust",
+        "scaler": scaler,
         "channels": VALID_CHANNELS,
         "n_files": ok_files_counter,
         "n_windows": number_of_windows,
@@ -383,13 +389,26 @@ def apply_scaler(windows: np.ndarray, stats: dict | None) -> np.ndarray:
     """
     if stats is None or windows.shape[0] == 0:
         return windows
+
+    expected_channels = len(VALID_CHANNELS)
+    channels = stats.get("channels")
+    median = np.asarray(stats.get("median"))
+    iqr = np.asarray(stats.get("iqr"))
+    if channels != VALID_CHANNELS:
+        raise ValueError("Las estadísticas del scaler no coinciden con VALID_CHANNELS")
+    if median.shape != (expected_channels,) or iqr.shape != (expected_channels,):
+        raise ValueError("Las estadísticas del scaler tienen dimensiones inválidas")
+    if not np.isfinite(median).all() or not np.isfinite(iqr).all() or (iqr < 0).any():
+        raise ValueError("Las estadísticas del scaler contienen valores inválidos")
+    if windows.ndim != 3 or windows.shape[1] != expected_channels:
+        raise ValueError("Las ventanas no tienen la cantidad esperada de canales")
     
     w = windows.astype(np.float64) #copia mi arreglo y cambia el tipo de datos a 64 bits para q la resta y división sea precisa. Después lo vuelvo a 32 por los motivmos mencionados en otras funciones
     
     
-    median = stats["median"][:, None]  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
+    median = median[:, None]  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
     #así median queda de (16, 1) y se alínea (desde la derecha) con w que es (numero_de_ventanas, 16, 1310). Los 16 quedan alineaditos
-    iqr = stats["iqr"][:, None]        # IQR por canal (hago lo mismo q hice con median recién)
+    iqr = iqr[:, None]        # IQR por canal (hago lo mismo q hice con median recién)
     
     denom = np.where(iqr == 0, 1.0, iqr)#evito dividir por 0 entonces si en algún canal x error quedó el iqr 0 (sería q tuvo valores ctes todo el tiempo), lo seteo en 1
 
@@ -437,7 +456,9 @@ def process_edf(path, seizures: list[tuple[int, int]], *, fs: int = FS, win_samp
                 scaler_stats: dict | None = None, do_scale: bool = True) -> dict:
     """
     Procesa UN archivo EDF completo:
-    EDF -> 16 canales TUEV -> filtro 0.5–50 Hz -> ventanas 5.12 s / 50% -> etiquetado -> (si scale es true) escala por canal con stats de train.
+    EDF -> 16 canales TUEV -> filtro 0.5–50 Hz -> ventanas nominales 5.12 s
+    (1310 muestras) / 50% -> etiquetado -> (si scale es true) escala por canal
+    con stats de train. El procesamiento es offline sobre el EDF completo.
 
     Devuelve un dict:
         ok=True:  windows (n,W), labels (n), starts (n, seg), fs.
@@ -446,34 +467,40 @@ def process_edf(path, seizures: list[tuple[int, int]], *, fs: int = FS, win_samp
     if not Path(path).exists():
         return {"ok": False, "reason": "archivo_no_existe"}
 
-    #matriz_señales es la matriz en la que cada fila es un canal (Ya reconstruido) y c columna contiene la amplitud
-    #de la señal en cada instante de tiempo
-    matriz_señales, reason = load_16_channels(path, fs_expected=fs)
-    if matriz_señales is None:
-        return {"ok": False, "reason": reason}
+    if fs <= 0 or win_samples <= 0 or stride <= 0:
+        return {"ok": False, "reason": "parametros_de_segmentacion_invalidos"}
 
-    #hago el butterworth
-    filtered = filter_bandpass(matriz_señales, fs=fs)
-    #filtro las ventanas
-    windows, starts = segment_windows(filtered, win_samples=win_samples, stride=stride)
-    #obtengo mi cantidad de ventanas (ahora es mi dimensión 0 después del transpose q hice)
-    n_win = windows.shape[0]
-    #hago una clasificación binaria de las ventanas del archivo. 1 si se superpone con algún instante de crisis, 0 si no.
-    labels = label_windows(starts, n_win, seizures, fs=fs)
-    
-    if do_scale:
-        windows = apply_scaler(windows, scaler_stats)
-    #devuelvo toda la datita
-    return {
-        "ok": True,
-        "file": Path(path).name,
-        "windows": windows,
-        "labels": labels,
-        "starts": (starts / fs).astype(np.float64),
-        "n_windows": n_win,
-        "n_positive": int(labels.sum()),
-        "fs": fs,
-    }
+    try:
+        matriz_señales, reason = load_16_channels(path, fs_expected=fs)
+        if matriz_señales is None:
+            return {"ok": False, "reason": reason}
+
+        filtered = filter_bandpass(matriz_señales, fs=fs)
+        windows, starts = segment_windows(filtered, win_samples=win_samples, stride=stride)
+        n_win = windows.shape[0]
+        labels = label_windows(
+            starts,
+            n_win,
+            seizures,
+            fs=fs,
+            win_seconds=win_samples / fs,
+        )
+
+        if do_scale:
+            windows = apply_scaler(windows, scaler_stats)
+
+        return {
+            "ok": True,
+            "file": Path(path).name,
+            "windows": windows,
+            "labels": labels,
+            "starts": (starts / fs).astype(np.float64),
+            "n_windows": n_win,
+            "n_positive": int(labels.sum()),
+            "fs": fs,
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 # HELPERS DEL CLI---------------------------------------------------------------------
 
@@ -481,21 +508,18 @@ def _train_files_from_split(data_dir: Path, split: dict) -> list[Path]:
     """Lista de EDFs (solo los anotados en el summary) para los pacientes de train."""
     files: list[Path] = []
     for patient in split["train"]:
-        summary = data_dir / patient / f"{patient}-summary.txt"
-        if not summary.exists():
-            print(f"[WARN] {patient}: no tiene summary; se omite.")
-            continue
-        from src.annotations import parse_summary
-        for fname in parse_summary(summary):
-            p = data_dir / patient / fname
-            if p.exists():
-                files.append(p)
-            else:
-                print(f"[WARN] {patient}/{fname} anotado pero no existe en disco.")
+        files.extend(files_for_patient(data_dir, patient))
     return files
 
 
-def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients: list[str] | None) -> None:
+def compute_stats(
+    data_dir: Path,
+    split_file: Path,
+    limit: int | None,
+    patients: list[str] | None,
+    out: Path = SCALER_STATS_FILE,
+) -> None:
+    # Lee el split para saber qué pacientes forman el train del scaler.
     split = json.loads(split_file.read_text(encoding="utf-8"))
     annotations = load_annotations(data_dir)
 
@@ -508,7 +532,7 @@ def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients:
         train_files = [p for p in train_files if p.parent.name in wanted]
         if not train_files:
             sys.exit("Ningún archivo de los pacientes pedidos quedó en TRAIN.")
-    if limit:
+    if limit is not None:
         train_files = train_files[:limit]
 
     files_by_name = {p.name: p for p in train_files}
@@ -522,15 +546,20 @@ def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients:
           f"{len(train_files)} archivos de TRAIN...")
     
     stats = preprocess_train_data(train_files, seizures_by_file)
-    save_stats(stats)
+    # Guarda las estadísticas en la ruta específica del fold o del modelo final.
+    save_stats(stats, out)
     
-    print(f"Stats guardadas en: {SCALER_STATS_FILE}")
+    print(f"Stats guardadas en: {out}")
     print("\nmediana por canal (center_):", np.array2string(stats["median"], precision=3, suppress_small=False))
     print("IQR por canal (scale_):     ", np.array2string(stats["iqr"], precision=3, suppress_small=False))
     print(f"Ventanas de train usadas: {stats['n_windows']} | archivos: {stats['n_files']}")
     print(f"(mediana e IQR estimados sobre {stats['n_points']} puntos submuestreados)")
 
-def test_file_cli(data_dir: Path, edf_path: str) -> None:
+def test_file_cli(
+    data_dir: Path,
+    edf_path: str,
+    scaler_stats_path: Path = SCALER_STATS_FILE,
+) -> None:
     """CLI --test-file: procesa un único EDF y muestra un resumen (smoke-test)."""
     path = Path(edf_path)
     if not path.exists():
@@ -549,6 +578,8 @@ def test_file_cli(data_dir: Path, edf_path: str) -> None:
     if not res["ok"]:
         sys.exit(f"[FAIL] {res['reason']}")
     windows, labels, starts = res["windows"], res["labels"], res["starts"]
+    if windows.shape[0] == 0:
+        sys.exit("[FAIL] el EDF no contiene ventanas completas")
     print(f"Ventanas: {windows.shape}  (n, canales, muestras)")
     print(f"Labels: {labels.sum()} positivas de {len(labels)} "
           f"({100 * labels.mean():.2f}%)")
@@ -557,7 +588,8 @@ def test_file_cli(data_dir: Path, edf_path: str) -> None:
     # cada canal quede centrado en mediana~0 con IQR~1 (lo que garantiza el RobustScaler).
     print("\nControl del escalado robusto por canal (tras stats de TRAIN: mediana~0, IQR~1):")
     try:
-        stats = load_scaler_stats()
+        # Usa explícitamente el scaler pedido para esta prueba del EDF.
+        stats = load_scaler_stats(scaler_stats_path)
     except RuntimeError as exc:
         # El npz viejo es de z-score/min-max: se avisa y se sigue sin el control.
         print(f"   (aviso: {exc})")
@@ -576,6 +608,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Preprocesamiento de EDFs CHB-MIT")
     parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
     parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
+    parser.add_argument(
+        "--stats-out",
+        type=str,
+        default=str(SCALER_STATS_FILE),
+        help="Ruta del scaler .npz a generar.",
+    )
+    parser.add_argument(
+        "--scaler-stats",
+        type=str,
+        default=str(SCALER_STATS_FILE),
+        help="Ruta del scaler .npz a usar en --test-file.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Procesar solo N archivos (smoke-test).")
     parser.add_argument("--patients", type=str, default=None, help="Solo estos pacientes (csv).")
 
@@ -587,6 +631,9 @@ def main() -> None:
 
     # lee sys.argv, chequea que los flags sean válidos
     args = parser.parse_args()
+
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit debe ser mayor que cero")
     
     data_dir = Path(args.data_dir)
     if not data_dir.is_dir():
@@ -594,11 +641,17 @@ def main() -> None:
 
     if args.compute_stats:
         patients = args.patients.split(",") if args.patients else None
-        compute_stats(data_dir, Path(args.split_file), args.limit, patients)
+        compute_stats(
+            data_dir,
+            Path(args.split_file),
+            args.limit,
+            patients,
+            Path(args.stats_out),
+        )
 
     #test para un solo archivo (no es para prod)
     else: 
-        test_file_cli(data_dir, args.test_file)
+        test_file_cli(data_dir, args.test_file, Path(args.scaler_stats))
 
 
 if __name__ == "__main__":

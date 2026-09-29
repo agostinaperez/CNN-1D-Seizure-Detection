@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.config import DECISION_TIME_MODE, FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.timing import decision_times_from_local_ids
 
 
 def _span_hours(n_windows: int) -> float:
@@ -140,20 +141,22 @@ def select_operating_point(curve: list[dict], min_sensibility: float) -> dict | 
 
 def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                   threshold: float, n_within: int = 3, n_window: int = 4,
-                  min_alarm_interval: float = 30.0, max_latency: float = 30.0) -> dict:
+                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                  decision_time_mode: str = DECISION_TIME_MODE) -> dict:
     """
     Evaluación a nivel EVENTO (crisis), como en el paper 1DCNN (IEEE TNSRE 2025).
 
     - Postprocesado: disparo una alarma cuando hay >= `n_within` predicciones
       positivas dentro de las últimas `n_window` ventanas CONSECUTIVAS (por archivo,
-      porque el tiempo se reinicia en cada EDF).
+      porque el tiempo se reinicia en cada EDF). La alarma se ubica al final de
+      la ventana, que es cuando la prediccion esta disponible.
     - Supresión: entre dos alarmas debe haber >= `min_alarm_interval` segundos.
     - Una crisis anotada se considera DETECTADA si hay una alarma dentro de
       [onset, onset + max_latency].
     - Latencia = tiempo desde el onset de la crisis hasta su primera alarma.
 
-    Devuelve sensibilidad (evento), FDR (falsas alarmas / hora), latencia media y
-    mediana, y conteos crudos.
+    Devuelve sensibilidad (evento), falsas detecciones por hora de registro
+    cubierto, latencia media y mediana, y conteos crudos.
     """
     probs = np.asarray(probs).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
@@ -171,7 +174,9 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         order = np.argsort(local_ids[idx])
         idx = idx[order]
         p = pred[idx]
-        win_times = local_ids[idx].astype(np.float64) * STRIDE_SAMPLES / FS
+        # La red ve la ventana completa. La convención offline ubica la decisión
+        # cuando termina la ventana, no en su instante de inicio.
+        win_times = decision_times_from_local_ids(local_ids[idx], decision_time_mode)
 
         alarm_times: list[float] = []
         last_alarm = -np.inf
@@ -228,8 +233,9 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
 
 def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                                  min_sensibility: float, n_within: int = 3, n_window: int = 4,
-                                 min_alarm_interval: float = 30.0, max_latency: float = 30.0,
-                                 thresholds=None) -> tuple[dict | None, float | None]:
+                                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                                  thresholds=None,
+                                  decision_time_mode: str = DECISION_TIME_MODE) -> tuple[dict | None, float | None]:
     """
     Punto de operación a nivel EVENTO: entre los umbrales cuya sensibilidad de CRISIS
     >= `min_sensibility`, el de MENOR FDR (falsas detecciones / hora).
@@ -252,7 +258,8 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
         ev = event_metrics(probs, labels, file_ids=file_ids, local_ids=local_ids,
                            valid_files=valid_files, annotations=annotations, threshold=t,
                            n_within=n_within, n_window=n_window,
-                           min_alarm_interval=min_alarm_interval, max_latency=max_latency)
+                           min_alarm_interval=min_alarm_interval, max_latency=max_latency,
+                           decision_time_mode=decision_time_mode)
         if ev["sensibility"] >= min_sensibility:
             if best is None or ev["false_detection_per_hour"] < best["false_detection_per_hour"]:
                 best = ev

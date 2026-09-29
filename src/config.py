@@ -27,10 +27,10 @@ SCALER_STATS_FILE = PROCESSED_DIR / "scaler_stats.npz"
 # Frecuencia de muestreo en Hz
 FS = 256
 # según nyquist con 256 muestras puedo representar máx 128 Hz, pero mi pasabanda llega a 50Hz así q no tengo riesgo de aliasing
-# Duración de cada ventana de análisis (segundos). 5.12 * 256 = 1310.72.
+# Duración nominal de cada ventana de análisis (segundos).
 WIN_SECONDS = 5.12
 # Muestras por ventana: redondeamos HACIA ABAJO -> 1310 (par).
-# Ventaja del par: solapamiento 50% EXACTO (650/1310) y pooling sin restos.
+# La duración efectiva es WIN_SAMPLES / FS = 5.1171875 s.
 WIN_SAMPLES = int(FS * WIN_SECONDS)
 # Duración física real de las ventanas después del redondeo a muestras.
 WIN_SECONDS_EFFECTIVE = WIN_SAMPLES / FS
@@ -41,6 +41,10 @@ WIN_SAMPLES_USED = WIN_SAMPLES
 OVERLAP = 0.5
 # Paso (stride) entre inicios de ventana: 50% de la ventana = 655 muestras.
 STRIDE_SAMPLES = int(WIN_SAMPLES_USED * (1.0 - OVERLAP))
+
+# Convención temporal para el procesamiento offline de EDFs pregrabados. La
+# predicción de una ventana se reporta en su extremo final.
+DECISION_TIME_MODE = "window_end"
 
 # Filtrado pasabanda de frecuencias baja (0.5 Hz, deriva lenta) y alta (50 Hz, ruido de red).
 LOW_FREQ = 0.5

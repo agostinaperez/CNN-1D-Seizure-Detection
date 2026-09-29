@@ -48,6 +48,11 @@ def split_dataset(
 
     Devuelve (train, test) con los códigos de paciente.
     """
+    if not 0.0 < test_ratio < 1.0:
+        raise ValueError("test_ratio debe estar entre 0 y 1")
+    if w_zsec < 0:
+        raise ValueError("w_zsec no puede ser negativo")
+
     # 1) Orden de "severidad": pacientes con más crisis primero, así los
     #    "graves" no se van todos juntos para el mismo lado al final.
     ordered = sorted(stats, key=lambda s: (s["seizure_seconds"], s["n_files"]), reverse=True)
@@ -60,9 +65,9 @@ def split_dataset(
     # La meta: train debe quedarse con el 70% (lo que no va a test).
     target_train = 1.0 - test_ratio
 
-    # Acumuladores: cuántos archivos / seg. de crisis ya repartimos a cada lado.
-    train_files = test_files = 0
-    train_zsec = test_zsec = 0.0
+    # Acumuladores: cuántos archivos / seg. de crisis ya repartimos a train.
+    train_files = 0
+    train_zsec = 0.0
 
     train_patients: list[str] = []
     test_patients: list[str] = []
@@ -95,8 +100,6 @@ def split_dataset(
         # Elegimos la opción que menos se desvía (¿queda mejor en train o en test?).
         if dev_to_test < dev_to_train:
             test_patients.append(s["patient"])
-            test_files += f
-            test_zsec += zsec
         else:
             train_patients.append(s["patient"])
             train_files += f
@@ -119,9 +122,13 @@ def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N
     train_sorted = sorted(train_patients, key=lambda p: sev.get(p, 0))
 
     # Elegimos posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición
-    assert len(train_sorted) > n_val, (
-        "Se necesitan más pacientes de train que " f"{n_val} para reservar validación."
-    )
+    if n_val < 0:
+        raise ValueError("n_val no puede ser negativo")
+    if len(train_sorted) <= n_val:
+        raise ValueError(
+            f"Se necesitan más pacientes de train que {n_val} para reservar validación; "
+            f"hay {len(train_sorted)}."
+        )
     idx = [(k * len(train_sorted)) // (n_val + 1) for k in range(1, n_val + 1)]
 
     # Tomamos las n_val posiciones centrales disponibles.
@@ -183,6 +190,8 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
 
     total_files = sum(s["n_files"] for s in stats)
     total_zsec = sum(s["seizure_seconds"] for s in stats)
+    if total_files <= 0:
+        raise ValueError("No hay archivos EDF válidos para construir el split.")
     summary = {
         "data_dir": str(data_dir),
         "test_ratio_solicitado": TEST_RATIO,
@@ -203,7 +212,7 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
             ),
             "frac_test_seizure_seconds": round(
                 volume(test)["seizure_seconds"] / total_zsec, 4
-            ),
+            ) if total_zsec > 0 else 0.0,
         },
     }
     return summary

@@ -11,7 +11,8 @@ Junta `data.py` con `model.py` y entrena la red para clasificar cada ventana de 
   3. Instancia la CNN, el optimizador AdamW y el loss BCEWithLogits con pos_weight.
   4. Corre las épocas: por cada batch -> ventanas -> red -> loss -> backward -> paso del optimizador. Al final de cada época evalúa en validación.
   5. Early stopping: si el loss de val no mejora en PATIENCE épocas, corta.
-  6. Guarda el mejor modelo en models/best.pt (pesos + config + stats de escalado para poder inferir después sin re-entrenar).
+  6. Guarda el mejor modelo cuando algún punto de operación cumple el objetivo
+     clínico, junto con su configuración y stats de escalado.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from src.config import (
     CONV_CHANNELS,
     CONV_KERNELS,
     DATASET_DIR,
+    DECISION_TIME_MODE,
     DROPOUT,
     EPOCHS,
     EVENT_MAX_LATENCY,
@@ -58,6 +60,7 @@ from src.config import (
     WEIGHT_DECAY,
 )
 from src.data import build_splits_dataloaders, compute_positive_weight
+from src.cross_validation import split_signature
 from src.metrics import binary_metrics, event_metrics, select_event_operating_point, select_operating_point, threshold_sweep
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
@@ -173,9 +176,14 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
 
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     epoch: int, best_val_loss: float, pos_weight: float, seed: int,
+                    neg_pos_ratio: float = NEG_POS_RATIO,
+                    split_signature_value: str | None = None,
+                    cv_fold: int | None = None,
+                    cv_n_folds: int | None = None,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
                     op_fdr_per_hour: float = float("inf"),
-                    min_event_sensitivity: float = MIN_EVENT_SENSITIVITY) -> None:
+                    min_event_sensitivity: float = MIN_EVENT_SENSITIVITY,
+                    final_train: bool = False) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar.
 
@@ -186,14 +194,16 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
       - model_state_dict: los valores de TODOS los pesos (la "memoria" aprendida);
       - config del modelo: listas de canales/kernels, fc_units, dropout, etc. (para reconstruir la arquitectura idéntica al cargar);
       - scaler_stats: mediana/IQR por canal del RobustScaler (para que inference escale las ventanas nuevas EXACTAMENTE igual que en train);
-      - metadata: época, best_val_loss, pos_weight, seed (auditoría);
+      - metadata: época, best_val_loss, pos_weight, neg_pos_ratio, seed (auditoría);
       - op_*: punto de operación elegido en val a nivel EVENTO (umbral, sensibilidad
         de crisis y FDR = falsas detecciones / hora).
 
     Se guarda en disco el momento en que el criterio clínico (menor FDR con sens
     de crisis >= objetivo) fue el mejor, no el loss crudo.
     """
+    # Crea la carpeta destino, por ejemplo models/cv/ratio3_pw1/.
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Agrupa pesos, scaler y metadata en un único archivo portable.
     checkpoint = {
         "format_version": 2,
         "model_state_dict": model.state_dict(),
@@ -204,6 +214,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
             "fc_units": FC_UNITS,
             "dropout": DROPOUT,
         },
+        # Guarda el scaler del train exacto que produjo este modelo.
         "scaler_stats": {
             "channels": scaler_stats["channels"],
             "median": torch.as_tensor(scaler_stats["median"], dtype=torch.float64).cpu(),
@@ -213,6 +224,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "op_threshold": op_threshold,
         "op_sensibility": op_sensibility,
         "op_fdr_per_hour": op_fdr_per_hour,
+        # Guarda las reglas que convierten predicciones de ventana en alarmas.
         "event_config": {
             "n_within": EVENT_N_WITHIN,
             "n_window": EVENT_N_WINDOW,
@@ -223,9 +235,46 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
+        "neg_pos_ratio": neg_pos_ratio,
+        "decision_time_mode": DECISION_TIME_MODE,
+        # Guarda la identidad del split y del fold para evitar evaluaciones cruzadas.
+        "split_signature": split_signature_value,
+        "cv_fold": cv_fold,
+        "cv_n_folds": cv_n_folds,
+        "final_train": final_train,
         "seed": seed,
     }
+    # Serializa el checkpoint; desde este momento la ruta representa un modelo válido.
     torch.save(checkpoint, path)
+
+
+def save_oof_artifacts(path: Path, probs, labels, dataset) -> tuple[Path, Path]:
+    """Guarda predicciones out-of-fold y el contexto temporal de sus ventanas."""
+    # Asegura que los índices globales estén disponibles antes de serializarlos.
+    dataset._ensure_index()
+    # El archivo binario contiene arrays numéricos usados para seleccionar el threshold.
+    npz_path = path.with_suffix(".oof.npz")
+    np.savez_compressed(
+        npz_path,
+        probs=np.asarray(probs, dtype=np.float32),
+        labels=np.asarray(labels, dtype=np.int8),
+        file_ids=np.asarray(dataset.file_ids, dtype=np.int32),
+        local_ids=np.asarray(dataset.local_ids, dtype=np.int32),
+    )
+    # El JSON contiene nombres de archivos y anotaciones necesarias para métricas de evento.
+    meta_path = path.with_suffix(".oof.json")
+    valid_names = [str(file_path.name) for file_path in dataset.valid_files]
+    annotations = {
+        name: dataset.annotations.get(name, []) for name in valid_names
+    }
+    meta_path.write_text(
+        json.dumps(
+            {"valid_files": valid_names, "annotations": annotations},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return npz_path, meta_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,10 +352,19 @@ def main() -> None:
     print(f"Device: {device}  (semilla={args.seed})")
 
     # Carga del split y de las stats del escalador
+    # Carga el reparto de pacientes usado para esta corrida.
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+    # Firma el reparto para poder comprobarlo al evaluar.
+    split_signature_value = split_signature(split)
+    # Los folds generados por cross_validation.py guardan estos dos campos.
+    cv_fold = split.get("cv_fold")
+    cv_n_folds = split.get("cv_n_folds")
     scaler_stats = load_scaler_stats(Path(args.scaler_stats))
     if scaler_stats is None:
-        sys.exit("No existe scaler_stats.npz. Corré primero:\n""    python -m src.preprocessing --compute-stats\n")
+        sys.exit(
+            f"No existe el scaler indicado: {args.scaler_stats}. "
+            "Corré primero python -m src.preprocessing --compute-stats."
+        )
 
     loaders = build_splits_dataloaders(args.data_dir, split, scaler_stats, batch_size=args.batch_size,
         num_workers=args.num_workers, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed, limit_files=args.limit_files,)
@@ -361,7 +419,12 @@ def main() -> None:
     # MENOR FDR (falsas detecciones / hora). Ver PLAN_MVP §3.7.2.
     best_val_loss = float("inf")   # solo de referencia (se sigue guardando en el log)
     best_fdr = float("inf")
+    best_op_threshold = THRESHOLD  # umbral del mejor punto de operación
+    best_op_sensibility = 0.0      # sensibilidad de crisis de ese punto
     best_epoch = 0
+    # Permite distinguir una corrida que no encontró un punto clínicamente válido
+    # de una corrida que sí produjo un checkpoint nuevo.
+    checkpoint_saved = False
     patience_left = args.patience
     start = time.time()
     history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
@@ -404,6 +467,7 @@ def main() -> None:
             min_sensibility=args.min_event_sensitivity,
             n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
             min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
+            decision_time_mode=DECISION_TIME_MODE,
         )
 
         if op_ev is not None:
@@ -423,7 +487,8 @@ def main() -> None:
                                    threshold=_t,
                                    n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
                                    min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
-                                   max_latency=EVENT_MAX_LATENCY)
+                                   max_latency=EVENT_MAX_LATENCY,
+                                   decision_time_mode=DECISION_TIME_MODE)
                 if ev is None or _e["sensibility"] > ev["sensibility"]:
                     ev = _e
                     op_threshold = float(_t)
@@ -482,16 +547,25 @@ def main() -> None:
         if improved:
             best_fdr = op_fdr
             best_val_loss = val_loss
+            best_op_threshold = op_threshold
+            best_op_sensibility = op_sensibility
             best_epoch = epoch
             patience_left = args.patience
             save_checkpoint(
                 Path(args.out), model, scaler_stats,
                 epoch=epoch, best_val_loss=best_val_loss,
-                pos_weight=pos_weight, seed=args.seed,
+                pos_weight=pos_weight, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
+                split_signature_value=split_signature_value,
+                cv_fold=cv_fold, cv_n_folds=cv_n_folds,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
                 min_event_sensitivity=args.min_event_sensitivity,
             )
+            # Guarda las predicciones de la validación de esta mejor época para
+            # construir luego una validación out-of-fold global.
+            save_oof_artifacts(Path(args.out), probs, labels, val_ds)
+            # Solo se marca como guardado después de que torch.save terminó bien.
+            checkpoint_saved = True
             backup_file(Path(args.out), args.backup_dir)
             print(f"    -> mejor punto de operación (evento): sens={op_sensibility:.3f}, "
                   f"FDR={op_fdr:.3f}/h @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
@@ -508,22 +582,40 @@ def main() -> None:
     print(f"\n=== Fin del entrenamiento ===")
     print(f"Mejor época (por menor FDR con sens de crisis >= {args.min_event_sensitivity}): {best_epoch}")
     print(f"  val_loss de esa época: {best_val_loss:.6f}")
+    print(f"  punto de operación: umbral={best_op_threshold:.2f}  sens={best_op_sensibility:.3f}  FDR={best_fdr:.3f}/h")
     print(f"Tiempo total: {total_time / 60:.1f} min")
-    print(f"Checkpoint: {args.out}")
+    # No se imprime una ruta si esta corrida no creó un checkpoint.
+    if checkpoint_saved:
+        print(f"Checkpoint: {args.out}")
+    else:
+        print("Checkpoint: no guardado (ningún punto de operación alcanzó el objetivo).")
 
     # Guarda el historial por época (curvas loss/accuracy para la tesis). Se persiste
     # junto al checkpoint como <nombre>.history.json para que el notebook lo pueda leer sin re-entrenar.
     history_path = Path(args.out).with_name(Path(args.out).stem + ".history.json")
     history_path.parent.mkdir(parents=True, exist_ok=True)
+    # El historial se guarda incluso si no hubo checkpoint, para auditar el motivo.
     history_path.write_text(json.dumps({
         "history": history,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "best_fdr_per_hour": best_fdr,
+        "best_op_threshold": best_op_threshold,
+        "best_op_sensibility": best_op_sensibility,
         "min_event_sensitivity": args.min_event_sensitivity,
         "min_sensitivity": args.min_sensitivity,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,
+        "neg_pos_ratio": args.neg_pos_ratio,
+        "decision_time_mode": DECISION_TIME_MODE,
+        "split_signature": split_signature_value,
+        "cv_fold": cv_fold,
+        "cv_n_folds": cv_n_folds,
+        "checkpoint_saved": checkpoint_saved,
+        "oof_saved": checkpoint_saved,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
         "seed": args.seed,
     }, indent=2), encoding="utf-8")
     print(f"Historial de entrenamiento: {history_path}")

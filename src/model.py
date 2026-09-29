@@ -142,14 +142,16 @@ if __name__ == "__main__": #solo corre esto si yo ejecuto el archivo directo. cu
     #todo funciona igual excepto el dropout (en eval no se usa pq solo tiene sentido regularizar si entreno), y el batchnorm
     #use sus estadísticas guardadas en vez de las del batch
     model.eval()
-   
-   #cosas gráficas que me sirven a mí
-    summary(model, input_size=(64, 16, WIN_SAMPLES))
+
+    # `verbose=0` evita que torchinfo escriba caracteres de caja que la
+    # consola cp1252 de Windows no puede representar.
+    summary(model, input_size=(64, 16, WIN_SAMPLES), verbose=0)
     #a esto lo veo en https://netron.app
+    # `dynamo=False` evita el logger Unicode del exportador nuevo en Windows.
     torch.onnx.export(model, x, "model.onnx",
-                    input_names=["eeg"], output_names=["logit"])
-   
-   #desactivo el cálculo de los gradientes, todavía no me hace falta guardar el grafo de derivadas, me ahorra memoria y tiempo
+                      input_names=["eeg"], output_names=["logit"], dynamo=False)
+
+    #desactivo el cálculo de los gradientes, todavía no me hace falta guardar el grafo de derivadas, me ahorra memoria y tiempo
     with torch.no_grad():
         #escribir model(x) es equivalente a escribir model.forward(x). Y eso es, básicamente, meter x a la red y dejar q fluya
         #hasra el otro extremo. Pasa por todas las capas: los 6 bloques convolucionales, el GAP, el dropout, y la capa densa.

@@ -419,11 +419,14 @@ def smoke_cli(args) -> None:
     data_dir = Path(args.data_dir)
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
 
-    scaler_stats = load_scaler_stats(SCALER_STATS_FILE)
+    # Permite inspeccionar el scaler de un fold concreto, no solo el global.
+    scaler_path = Path(args.scaler_stats)
+    # Carga las estadísticas que se aplicarán a las ventanas del smoke test.
+    scaler_stats = load_scaler_stats(scaler_path)
     if scaler_stats is None:
         print("[WARN] No existe scaler_stats.npz: las ventanas salen SIN estandarizar.")
     else:
-        print(f"[ok] scaler_stats: '{scaler_stats['scaler']}', {scaler_stats['n_windows']} "
+        print(f"[ok] scaler_stats '{scaler_path}': '{scaler_stats['scaler']}', {scaler_stats['n_windows']} "
               f"ventanas de train (archivos: {scaler_stats['n_files']})")
 
     patients = split.get("train", [])
@@ -465,6 +468,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Dataset/DataLoader")
     parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
     parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
+    parser.add_argument("--scaler-stats", type=str, default=str(SCALER_STATS_FILE))
     parser.add_argument("--smoke", action="store_true", help="Smoke-test con pocos archivos.")
     parser.add_argument("--limit-files", type=int, default=3, help="Máx. de EDFs en el smoke.")
     parser.add_argument("--max-batches", type=int, default=5, help="Batches a imprimir.")
