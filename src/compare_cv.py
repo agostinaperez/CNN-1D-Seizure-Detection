@@ -66,10 +66,8 @@ def _fold_metrics(path: Path) -> dict:
         "oof_saved": bool(payload.get("oof_saved", True)),
         "cv_fold": payload.get("cv_fold"),
         "cv_n_folds": payload.get("cv_n_folds"),
-        "split_signature": payload.get("split_signature"),
         "neg_pos_ratio": payload.get("neg_pos_ratio"),
         "pos_weight": payload.get("pos_weight"),
-        "decision_time_mode": payload.get("decision_time_mode"),
         "learning_rate": payload.get("learning_rate"),
         "weight_decay": payload.get("weight_decay"),
         "batch_size": payload.get("batch_size"),
@@ -128,7 +126,7 @@ def summarize_cv(
         # Acumula inconsistencias que invalidan la comparación del experimento.
         consistency_errors: list[str] = []
         for key in (
-            "neg_pos_ratio", "pos_weight", "decision_time_mode", "seed",
+            "neg_pos_ratio", "pos_weight", "seed",
             "learning_rate", "weight_decay", "batch_size",
         ):
             values = {fold[key] for fold in folds}

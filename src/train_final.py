@@ -28,7 +28,6 @@ import torch.optim as optim
 from src.config import (
     BATCH_SIZE,
     DATASET_DIR,
-    DECISION_TIME_MODE,
     GRAD_CLIP,
     LR_MIN,
     MODELS_DIR,
@@ -37,12 +36,10 @@ from src.config import (
     SPLIT_FILE,
     WEIGHT_DECAY,
 )
-from src.cross_validation import split_signature
 from src.data import build_splits_dataloaders
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
 from src.train import backup_file, get_device, save_checkpoint, set_seed, train_one_epoch
-from src.timing import validate_decision_time_mode
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,15 +80,6 @@ def main() -> None:
     learning_rate = float(recommendation["learning_rate"])
     weight_decay = float(recommendation["weight_decay"])
     batch_size = args.batch_size or int(recommendation["batch_size"])
-    # El final debe conservar la convención temporal usada por los folds OOF.
-    recommendation_mode = validate_decision_time_mode(
-        recommendation.get("decision_time_mode", DECISION_TIME_MODE)
-    )
-    if recommendation_mode != DECISION_TIME_MODE:
-        sys.exit(
-            f"La recomendación usa decision_time_mode={recommendation_mode}, "
-            f"pero la configuración actual usa {DECISION_TIME_MODE}."
-        )
 
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
     if not split.get("final_train", False) or split.get("val"):
@@ -149,7 +137,6 @@ def main() -> None:
         scheduler.step()
 
     output = Path(args.out)
-    split_signature_value = split_signature(split)
     save_checkpoint(
         output,
         model,
@@ -158,7 +145,6 @@ def main() -> None:
         best_val_loss=float("nan"),
         pos_weight=pos_weight,
         neg_pos_ratio=neg_pos_ratio,
-        split_signature_value=split_signature_value,
         cv_fold=None,
         cv_n_folds=None,
         op_threshold=threshold,
@@ -178,7 +164,6 @@ def main() -> None:
                 "final_train": True,
                 "checkpoint_saved": True,
                 "recommendation": str(Path(args.recommendation)),
-                "split_signature": split_signature_value,
                 "epochs": epochs,
                 "threshold": threshold,
                 "neg_pos_ratio": neg_pos_ratio,

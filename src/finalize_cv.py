@@ -21,7 +21,6 @@ import numpy as np
 
 from src.config import MIN_EVENT_SENSITIVITY
 from src.metrics import event_metrics, select_event_operating_point
-from src.timing import validate_decision_time_mode
 
 
 def _fold_number(path: Path) -> int:
@@ -117,7 +116,6 @@ def _load_oof(experiment_dir: Path, expected_folds: int) -> tuple[dict, list[dic
 def _fallback_max_sensitivity(
     combined: dict,
     thresholds=None,
-    decision_time_mode: str = "window_end",
 ) -> tuple[dict, float]:
     """Elige el máximo de sensibilidad solo para dejar una recomendación informativa."""
     if thresholds is None:
@@ -130,7 +128,6 @@ def _fallback_max_sensitivity(
             file_ids=combined["file_ids"], local_ids=combined["local_ids"],
             valid_files=combined["valid_files"], annotations=combined["annotations"],
             threshold=float(threshold),
-            decision_time_mode=decision_time_mode,
         )
         if best is None or metrics["sensibility"] > best["sensibility"]:
             best = metrics
@@ -145,24 +142,18 @@ def build_recommendation(
 ) -> dict:
     """Selecciona threshold global y época final usando solamente OOF."""
     combined, histories = _load_oof(experiment_dir, expected_folds)
-    # Todas las predicciones OOF deben compartir la misma convención temporal.
-    modes = {payload.get("decision_time_mode") for payload in histories}
-    if len(modes) != 1 or None in modes:
-        raise ValueError(f"decision_time_mode inconsistente entre folds: {modes}")
-    decision_time_mode = validate_decision_time_mode(modes.pop())
     # El criterio de selección se aplica sobre todos los pacientes OOF juntos.
     selected, threshold = select_event_operating_point(
         combined["probs"], combined["labels"],
         file_ids=combined["file_ids"], local_ids=combined["local_ids"],
         valid_files=combined["valid_files"], annotations=combined["annotations"],
         min_sensibility=min_event_sensitivity,
-        decision_time_mode=decision_time_mode,
     )
     eligible = selected is not None
     if selected is None:
         # No habilita el entrenamiento final clínicamente elegible, pero deja
         # registrado el mejor compromiso alcanzable para diagnóstico.
-        selected, threshold = _fallback_max_sensitivity(combined, decision_time_mode=decision_time_mode)
+        selected, threshold = _fallback_max_sensitivity(combined)
 
     # Se usa la mediana de las mejores épocas de los folds como calendario final.
     best_epochs = [int(payload["best_epoch"]) for payload in histories if payload.get("best_epoch", 0) > 0]
@@ -171,7 +162,7 @@ def build_recommendation(
     final_epochs = max(1, int(round(float(np.median(best_epochs)))))
 
     # Todos los folds de un experimento deben compartir estos hiperparámetros.
-    keys = ("neg_pos_ratio", "pos_weight", "seed", "decision_time_mode", "learning_rate", "weight_decay", "batch_size")
+    keys = ("neg_pos_ratio", "pos_weight", "seed", "learning_rate", "weight_decay", "batch_size")
     metadata = {}
     for key in keys:
         values = {payload.get(key) for payload in histories}

@@ -15,28 +15,12 @@ from __future__ import annotations
 
 import argparse  # Construye la interfaz de línea de comandos.
 import copy  # Copia el split base sin modificarlo accidentalmente.
-import hashlib  # Calcula una firma reproducible de las listas de pacientes.
 import json  # Lee y escribe los archivos de split.
 from pathlib import Path
 
 import numpy as np  # Se usa para comparar cargas de pacientes entre folds.
 
 from src.config import PROCESSED_DIR, SEED, SPLIT_FILE
-
-
-def split_signature(split: dict) -> str:
-    """Firma estable de las listas de pacientes de un split."""
-    # Solo se firma la pertenencia de pacientes a cada conjunto, no rutas ni metadatos.
-    payload = {
-        # El orden se conserva porque también forma parte del split reproducible.
-        "train": list(split.get("train", [])),
-        "val": list(split.get("val", [])),
-        "test": list(split.get("test", [])),
-    }
-    # Se serializa con orden estable para obtener siempre los mismos bytes.
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    # La firma permite detectar si se evalúa un checkpoint contra otro split.
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _patient_load(split: dict, patient: str) -> tuple[float, float, float]:
