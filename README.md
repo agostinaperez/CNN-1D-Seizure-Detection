@@ -73,10 +73,7 @@ ia-final/
     ├── model.py                 <- arquitectura CNN-1D apilada
     ├── train.py                 <- loop de entrenamiento + métricas + checkpoint
     ├── evaluate.py              <- evaluación inter-paciente (val/test)
-    ├── cross_validation.py      <- folds agrupados por paciente
-    ├── compare_cv.py            <- comparación de experimentos por validación
-    ├── finalize_cv.py           <- threshold y épocas finales desde OOF
-    ├── train_final.py           <- entrenamiento final con todo el desarrollo
+    ├── select_best.py           <- selección del mejor escenario por validación
     └── inference.py             <- CLI de inferencia sobre .edf
 ```
 
@@ -314,7 +311,7 @@ Después de esta evaluación no se deben cambiar hiperparámetros usando ese
 resultado. Si se cambia algo, hay que repetir la selección sobre validación y
 reservar el test nuevamente para el final.
 
-### 7.9 Inferencia sobre un EDF
+### 7.6 Inferencia sobre un EDF
 
 La inferencia no necesita labels. Puede ejecutarse sobre un EDF de train, val o
 test para mostrar el funcionamiento del MVP, siempre que se aclare que usar un
@@ -324,7 +321,7 @@ hiperparámetros.
 ```bash
 python -m src.inference \
     --input <ruta/al/archivo.edf> \
-    --checkpoint models/final.pt
+    --checkpoint models/<ganador>.pt
 ```
 
 La predicción de cada ventana se considera disponible al final de la ventana.

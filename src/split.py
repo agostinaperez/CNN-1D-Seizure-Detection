@@ -29,6 +29,7 @@ from src.config import (
     SPLIT_W_ZSEC,
     TEST_RATIO,
 )
+from src.protocol import PROTOCOL_VERSION, split_id
 
 
 def split_dataset(
@@ -193,8 +194,11 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
     if total_files <= 0:
         raise ValueError("No hay archivos EDF válidos para construir el split.")
     summary = {
+        "protocol_version": PROTOCOL_VERSION,
         "data_dir": str(data_dir),
         "test_ratio_solicitado": TEST_RATIO,
+        "n_val_patients_config": N_VAL_PATIENTS,
+        "split_w_zsec": SPLIT_W_ZSEC,
         "n_train": len(train_eff),
         "n_val": len(val),
         "n_test": len(test),
@@ -215,6 +219,7 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
             ) if total_zsec > 0 else 0.0,
         },
     }
+    summary["split_id"] = split_id(summary)
     return summary
 
 

@@ -32,6 +32,7 @@ from src.config import (
     FS,
     N_CHANNELS,
     NEG_POS_RATIO,
+    NOISE_STD,
     NUM_WORKERS,
     SCALER_STATS_FILE,
     SEED,
@@ -92,33 +93,34 @@ class WindowDataset(Dataset):
         #   _labels      -> por cada ventana global, 1 (crisis) o 0 (no crisis)
         self._built = False
         self._valid_files: list[Path] = []
+        self._skipped_files: list[dict[str, str]] = []
         self._file_ids: np.ndarray | None = None
         self._local_ids: np.ndarray | None = None
         self._labels: np.ndarray | None = None
 
     # Índice global (solo cabeceras, sin cargar la señal)
-    def _scan_header(self, path: Path) -> tuple[int, np.ndarray] | None:
-        """(n_ventanas, labels) leyendo solo la cabecera del EDF."""
+    def _scan_header(self, path: Path) -> tuple[tuple[int, np.ndarray] | None, str | None]:
+        """Devuelve datos de indexado o el motivo por el que se descarta."""
         raw = None
         try:
             raw = mne.io.read_raw_edf(path, preload=False, verbose="ERROR")
             fs = float(raw.info["sfreq"])
             if abs(fs - FS) > 1e-6:
-                return None
+                return None, f"sampling_rate_invalida ({fs:g} Hz != {FS})"
             names = [normalize_channel_name(c) for c in raw.ch_names]
             if _solve_selection(names) is None:
-                return None
+                return None, "channels_incompatible"
             n_total = int(raw.n_times)
             n_windows = (n_total - WIN_SAMPLES) // STRIDE_SAMPLES + 1
             if n_windows <= 0:
-                return None
+                return None, "sin_ventanas_completas"
 
             starts = np.arange(n_windows, dtype=np.int64) * STRIDE_SAMPLES
             labels = label_windows(starts, n_windows, self.annotations.get(path.name, []), fs=FS)
-            return n_windows, labels
+            return (n_windows, labels), None
         except Exception as exc:
             print(f"[WARN] {path.parent.name}/{path.name}: no se pudo leer el header ({exc})")
-            return None
+            return None, f"header_error: {type(exc).__name__}: {exc}"
         finally:
             if raw is not None:
                 raw.close()
@@ -129,8 +131,9 @@ class WindowDataset(Dataset):
             return
         file_ids, local_ids, all_labels, valid_files = [], [], [], []
         for path in self.files:
-            scan = self._scan_header(path)
+            scan, reason = self._scan_header(path)
             if scan is None:
+                self._skipped_files.append({"file": str(path), "reason": reason or "desconocido"})
                 continue
             n_windows, labels = scan
             file_id = len(valid_files)
@@ -230,6 +233,23 @@ class WindowDataset(Dataset):
         self._ensure_index()
         return self._valid_files
 
+    @property
+    def skipped_files(self) -> list[dict[str, str]]:
+        self._ensure_index()
+        return self._skipped_files
+
+    def audit_summary(self) -> dict:
+        """Resumen auditable de archivos y ventanas realmente utilizables."""
+        self._ensure_index()
+        return {
+            "input_files": len(self.files),
+            "valid_files": len(self._valid_files),
+            "skipped_files": list(self._skipped_files),
+            "windows": len(self),
+            "positive_windows": self.n_positive,
+            "negative_windows": len(self) - self.n_positive,
+        }
+
 
 # la clase que me arma un epoch de entrenamiento. Cada vez q lo recorro (con __iter__), decide qué ventanas entran,
 #las busca, las procesa, las amontona y las entrega. NO AMRA LOS BATCHES. ESO LO ARMA EL DATALOADER. Entonces si por época yo laburo con 100 archivos, devuelve los 100, aunque después mi batch sea de a 5
@@ -254,11 +274,15 @@ class BalancedEpochDataset(IterableDataset):
     """
 
     def __init__(self, dataset: WindowDataset, neg_pos_ratio: int | float = NEG_POS_RATIO,
-                 seed: int = SEED):
+                 seed: int = SEED, noise_std: float = NOISE_STD):
         self.dataset = dataset
         self.neg_pos_ratio = neg_pos_ratio
+        self.noise_std = noise_std
         # Semilla reproducible: se consume UNA vez por época
         self.rng = np.random.default_rng(seed)
+        # RNG independiente para el ruido gaussiano: no consume el stream del
+        # undersampling/shuffle, así ambos quedan reproducibles por separado.
+        self.noise_rng = np.random.default_rng(seed + 1000003)
 
     def _pick_indices(self) -> np.ndarray:
         """PASO 1: elige los índices globales de la época. Todas las ventanas de crisis + NEG_POS_RATIO x crisis de ventanas no-crisis
@@ -330,6 +354,17 @@ class BalancedEpochDataset(IterableDataset):
         windows = windows[order]
         labels = labels[order]
 
+        # Augmentación: ruido gaussiano SOLO sobre las ventanas de crisis
+        # (clase minoritaria), replicando el paper 1DCNN (IEEE TNSRE 2025).
+        if self.noise_std and self.noise_std > 0 and windows.shape[0] > 0:
+            positive_indices = np.flatnonzero(labels == 1)
+            if positive_indices.size:
+                positive_windows = windows[positive_indices]
+                noise = self.noise_rng.normal(
+                    0.0, self.noise_std, size=positive_windows.shape
+                ).astype(np.float32)
+                windows[positive_indices] = positive_windows + noise
+
         # PASO 5: entregar de a una. El DataLoader arma los batches
         for window, label in zip(windows, labels):
             #el for ... yield convierte este __iter__ en un generador. Cada vuelta genera (ventana, etiqueta) como tensores, se lo da a quien lo pidió y
@@ -357,7 +392,7 @@ def compute_positive_weight(dataset: WindowDataset, neg_pos_ratio: int | float =
 #solo la llamo desde train (Bah, desde build splits, pero a esa la llamo desde train)
 def make_dataloader(dataset: WindowDataset, *, balanced: bool, batch_size: int = BATCH_SIZE,
                     num_workers: int = NUM_WORKERS, neg_pos_ratio: int | float = NEG_POS_RATIO,
-                    seed: int = SEED) -> DataLoader:
+                    seed: int = SEED, noise_std: float = NOISE_STD) -> DataLoader:
     """DataLoader de un Dataset. `balanced=True` usa BalancedEpochDataset; `balanced=False` recorre TODAS las ventanas en orden (val/test, distribución natural)."""
     if batch_size <= 0:
         raise ValueError("batch_size debe ser mayor que cero")
@@ -371,13 +406,14 @@ def make_dataloader(dataset: WindowDataset, *, balanced: bool, batch_size: int =
         if num_workers != 0:
             print(f"[WARN] data.py: loader balanceado exige num_workers=0 "
                   f"se ignora num_workers={num_workers}.")
-        epoch_ds = BalancedEpochDataset(dataset, neg_pos_ratio=neg_pos_ratio, seed=seed)
+        epoch_ds = BalancedEpochDataset(dataset, neg_pos_ratio=neg_pos_ratio, seed=seed,
+                                        noise_std=noise_std)
         return DataLoader(epoch_ds, batch_size=batch_size, num_workers=0)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False,
                       num_workers=num_workers)
 
 #solo la llamo desde train
-def build_splits_dataloaders(data_dir: Path | str, split: dict, scaler_stats=None, *,  batch_size: int = BATCH_SIZE, num_workers: int = NUM_WORKERS, neg_pos_ratio: int | float = NEG_POS_RATIO, seed: int = SEED, limit_files: int | None = None) -> dict:
+def build_splits_dataloaders(data_dir: Path | str, split: dict, scaler_stats=None, *,  batch_size: int = BATCH_SIZE, num_workers: int = NUM_WORKERS, neg_pos_ratio: int | float = NEG_POS_RATIO, seed: int = SEED, noise_std: float = NOISE_STD, limit_files: int | None = None) -> dict:
     """
     Datasets y DataLoaders de train/val/test desde `split.json`.
     Devuelve:
@@ -398,7 +434,8 @@ def build_splits_dataloaders(data_dir: Path | str, split: dict, scaler_stats=Non
         dataset = WindowDataset(files, by_name, scaler_stats=scaler_stats)
         dataloader = make_dataloader(dataset, balanced=(name == "train"),
                                      batch_size=batch_size, num_workers=num_workers,
-                                     neg_pos_ratio=neg_pos_ratio, seed=seed)
+                                     neg_pos_ratio=neg_pos_ratio, seed=seed,
+                                     noise_std=noise_std)
         out[name] = {"dataset": dataset, "dataloader": dataloader}
     return out
 
@@ -419,7 +456,7 @@ def smoke_cli(args) -> None:
     data_dir = Path(args.data_dir)
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
 
-    # Permite inspeccionar el scaler de un fold concreto, no solo el global.
+    # Permite inspeccionar el scaler de un escenario concreto, no solo el global.
     scaler_path = Path(args.scaler_stats)
     # Carga las estadísticas que se aplicarán a las ventanas del smoke test.
     scaler_stats = load_scaler_stats(scaler_path)

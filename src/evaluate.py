@@ -16,7 +16,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 from src.config import (
     BATCH_SIZE,
@@ -39,6 +38,7 @@ from src.metrics import (
 )
 from src.model import SeizureCNN
 from src.train import evaluate, get_device
+from src.protocol import THRESHOLD_GRID, preprocessing_config, scaler_id, split_id
 
 
 def load_checkpoint(path: Path) -> dict:
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--threshold", type=float, default=None, help="Umbral de decisión. Por defecto usa el que guardó el checkpoint.")
-    parser.add_argument("--min-event-sensitivity", type=float, default=None, help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor FDR que la alcance.")
+    parser.add_argument("--min-event-sensitivity", type=float, default=None, help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor tasa de falsas alarmas por hora que la alcance.")
     parser.add_argument("--positives-for-event", type=int, default=None, help="Alarma si hay >= N positivos dentro de las últimas N_WINDOW ventanas (nivel evento).")
     parser.add_argument("--window-range-for-event", type=int, default=None, help="Cantidad de ventanas consecutivas consideradas para la regla de evento (nivel evento).")
     parser.add_argument("--event-min-alarm-interval", type=float, default=None, help="Segundos mínimos entre dos alarmas (nivel evento).")
@@ -146,10 +146,24 @@ def main() -> None:
 
     # Carga el split que se quiere evaluar.
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+    checkpoint_split_id = checkpoint.get("split_id")
+    current_split_id = split_id(split)
+    if checkpoint_split_id and checkpoint_split_id != current_split_id:
+        raise RuntimeError(
+            "El checkpoint y el split no coinciden: "
+            f"checkpoint={checkpoint_split_id}, split={current_split_id}."
+        )
     # El scaler_stats viene adentro del checkpoint y lo uso para escalar las ventanas de val/test EXACTAMENTE igual que en train
     scaler_stats = checkpoint.get("scaler_stats")
     if scaler_stats is None:
         sys.exit("El checkpoint no contiene estadísticas del scaler.")
+    if scaler_stats.get("split_id") and scaler_stats["split_id"] != current_split_id:
+        raise RuntimeError("El scaler embebido en el checkpoint no corresponde al split solicitado.")
+    if scaler_stats.get("scaler_id") and scaler_stats["scaler_id"] != scaler_id(scaler_stats):
+        raise RuntimeError("Las estadísticas del scaler embebidas están corruptas.")
+    saved_preprocessing = scaler_stats.get("preprocessing_config")
+    if saved_preprocessing and saved_preprocessing != preprocessing_config():
+        raise RuntimeError("El checkpoint fue creado con otro preprocesamiento.")
 
     # armo train/val/test. Para val/test recorre TODAS las ventanas en orden (sin undersampling, sin shuffle)
     # Construye datasets con el scaler embebido en el checkpoint.
@@ -160,6 +174,10 @@ def main() -> None:
     n_pos = int(dataset.n_positive)
     n_total = len(dataset)
     print(f"  Ventanas {args.split}: {n_total}  ({n_pos} positivas, {n_total - n_pos} negativas)")
+    audit = dataset.audit_summary()
+    print(f"  EDFs {args.split}: {audit['valid_files']}/{audit['input_files']} válidos")
+    if audit["skipped_files"]:
+        print(f"  [WARN] EDFs descartados: {len(audit['skipped_files'])}")
 
     # evaluar
     # mido el error sobre la distribución natural, x ende el Binary Cross entropy va sin pos-weight
@@ -217,7 +235,7 @@ def main() -> None:
     if ev is None:
         # ningún umbral alcanza el objetivo de sensibilidad de crisis -> mostramos el
         # umbral con la máxima sensibilidad de crisis alcanzable, a título informativo.
-        for _t in np.arange(0.05, 1.0, 0.05):
+        for _t in THRESHOLD_GRID:
             _e = event_metrics(probs, labels,
                                 file_ids=dataset.file_ids, local_ids=dataset.local_ids,
                                 valid_files=dataset.valid_files, annotations=dataset.annotations,
@@ -235,14 +253,21 @@ def main() -> None:
         print(f"  Threshold aplicado (fijado en validación): {ev_threshold:.2f}")
     else:
         print("\n  [NIVEL EVENTO (crisis)]")
-        print(f"  Punto de operación (sens de crisis >= {min_event_sensitivity}, menor FDR): "
-              f"umbral={ev_threshold:.2f}  FDR={ev['false_detection_per_hour']:.2f}/h")
+        print(f"  Punto de operación (sens de crisis >= {min_event_sensitivity}, menor tasa de falsas alarmas/h): "
+              f"umbral={ev_threshold:.2f}  falsas alarmas={ev['event_false_alarms_per_hour']:.2f}/h")
 
     print(f"  Sensibilidad:              {ev['sensibility']:.4f}  ({ev['n_detected']}/{ev['n_seizures']} crisis detectadas)")
-    print(f"  Falsas detecciones/hora:   {ev['false_detection_per_hour']:.4f}  ({ev['n_false_alarms']} falsas alarmas en {ev['total_hours']:.1f} h cubiertas)")
+    print(f"  Falsas alarmas de evento/h: {ev['event_false_alarms_per_hour']:.4f}  ({ev['n_false_alarms']} falsas alarmas en {ev['total_hours']:.1f} h cubiertas)")
     print(f"  Latencia media:            {ev['latency_mean']:.2f} s")
     print(f"  Latencia mediana:          {ev['latency_median']:.2f} s")
     print(f"  Postprocesado:             >= {positives_for_event} positivos en {window_range_for_event} ventanas consecutivas")
+    print("  Desglose por paciente:")
+    for patient, patient_metrics in sorted(ev["by_patient"].items()):
+        print(
+            f"    {patient}: sens={patient_metrics['sensitivity']:.4f} "
+            f"({patient_metrics['n_detected']}/{patient_metrics['n_seizures']}), "
+            f"falsas alarmas/h={patient_metrics['false_alarms_per_hour']:.4f}"
+        )
     print("=" * 70)
 
 

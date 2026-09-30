@@ -38,6 +38,7 @@ from src.config import (
     WIN_SAMPLES,
     WIN_SECONDS_EFFECTIVE,
 )
+from src.protocol import PROTOCOL_VERSION, preprocessing_config, scaler_id, split_id
 
 # En EEG, cada canal mide una diferencia de potencial entre 2 electrodos.
 # - Montaje monopolar: cada canal es un electrodo contra una referencia común (ej. "F7-CS2").
@@ -371,6 +372,12 @@ def save_stats(stats: dict, out: Path = SCALER_STATS_FILE) -> Path:
         "n_points": np.array([stats["n_points"]]),  # puntos (submuestreados) usados para los cuantiles
         "median": stats["median"],                   # mediana por canal (center_ del RobustScaler)
         "iqr": stats["iqr"],                         # IQR (Q75 - Q25) por canal (scale_ del RobustScaler)
+        "protocol_version": np.array([stats.get("protocol_version", PROTOCOL_VERSION)]),
+        "split_id": np.array([stats.get("split_id") or ""]),
+        "scaler_id": np.array([stats.get("scaler_id") or scaler_id(stats)]),
+        "preprocessing_config": np.array([
+            json.dumps(stats.get("preprocessing_config", preprocessing_config()), sort_keys=True)
+        ]),
     }
     np.savez_compressed(out, **arrays)
     return out
@@ -399,6 +406,13 @@ def load_scaler_stats(path: Path = SCALER_STATS_FILE) -> dict | None:
             "n_points": int(z["n_points"][0]) if "n_points" in z.files else 0,
             "median": z["median"],  # mediana por canal (center_ del RobustScaler)
             "iqr": z["iqr"],        # IQR (Q75 - Q25) por canal (scale_ del RobustScaler)
+            "protocol_version": int(z["protocol_version"][0]) if "protocol_version" in z.files else None,
+            "split_id": str(z["split_id"][0]) if "split_id" in z.files else None,
+            "scaler_id": str(z["scaler_id"][0]) if "scaler_id" in z.files else None,
+            "preprocessing_config": (
+                json.loads(str(z["preprocessing_config"][0]))
+                if "preprocessing_config" in z.files else None
+            ),
         }
     return stats
 
@@ -568,7 +582,11 @@ def compute_stats(
           f"{len(train_files)} archivos de TRAIN...")
     
     stats = preprocess_train_data(train_files, seizures_by_file)
-    # Guarda las estadísticas en la ruta específica del fold o del modelo final.
+    stats["protocol_version"] = PROTOCOL_VERSION
+    stats["split_id"] = split_id(split)
+    stats["scaler_id"] = scaler_id(stats)
+    stats["preprocessing_config"] = preprocessing_config()
+    # Guarda las estadísticas en la ruta específica del escenario o del modelo final.
     save_stats(stats, out)
     
     print(f"Stats guardadas en: {out}")

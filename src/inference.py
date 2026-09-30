@@ -44,6 +44,7 @@ from src.evaluate import load_checkpoint, rebuild_model
 from src.preprocessing import process_edf
 from src.train import get_device
 from src.timing import decision_times_from_starts
+from src.protocol import preprocessing_config
 
 
 def classify_windows(model, windows: np.ndarray, device: str, batch_size: int) -> np.ndarray:
@@ -164,6 +165,8 @@ def main() -> None:
     scaler_stats = ckpt.get("scaler_stats")
     if scaler_stats is None:
         sys.exit("El checkpoint no contiene estadísticas del scaler.")
+    if scaler_stats.get("preprocessing_config") and scaler_stats["preprocessing_config"] != preprocessing_config():
+        raise RuntimeError("El checkpoint fue creado con otro preprocesamiento.")
 
     # 2) Procesar el EDF ------------------------------------------------------------
     path = Path(args.input)

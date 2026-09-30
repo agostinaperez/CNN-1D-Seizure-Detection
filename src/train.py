@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import shutil
 import sys
@@ -49,6 +50,7 @@ from src.config import (
     MODELS_DIR,
     N_CHANNELS,
     NEG_POS_RATIO,
+    NOISE_STD,
     NUM_WORKERS,
     PATIENCE,
     SCALER_STATS_FILE,
@@ -61,6 +63,13 @@ from src.data import build_splits_dataloaders, compute_positive_weight
 from src.metrics import binary_metrics, event_metrics, select_event_operating_point
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
+from src.protocol import (
+    PROTOCOL_VERSION,
+    THRESHOLD_GRID,
+    compatibility_config,
+    scaler_id,
+    split_id,
+)
 
 
 
@@ -174,12 +183,11 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     epoch: int, best_val_loss: float, pos_weight: float, seed: int,
                     neg_pos_ratio: float = NEG_POS_RATIO,
-                    cv_fold: int | None = None,
-                    cv_n_folds: int | None = None,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
                     op_fdr_per_hour: float = float("inf"),
                     min_event_sensitivity: float = MIN_EVENT_SENSITIVITY,
-                    final_train: bool = False) -> None:
+                    noise_std: float = NOISE_STD,
+                    experiment_config: dict | None = None) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar.
 
@@ -192,12 +200,12 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
       - scaler_stats: mediana/IQR por canal del RobustScaler (para que inference escale las ventanas nuevas EXACTAMENTE igual que en train);
       - metadata: época, best_val_loss, pos_weight, neg_pos_ratio, seed (auditoría);
       - op_*: punto de operación elegido en val a nivel EVENTO (umbral, sensibilidad
-        de crisis y FDR = falsas detecciones / hora).
+        de crisis y tasa de falsas alarmas por hora).
 
-    Se guarda en disco el momento en que el criterio clínico (menor FDR con sens
+    Se guarda en disco el momento en que el criterio clínico (menor tasa de falsas alarmas/h con sens
     de crisis >= objetivo) fue el mejor, no el loss crudo.
     """
-    # Crea la carpeta destino, por ejemplo models/cv/ratio3_pw1/.
+    # Crea la carpeta destino, por ejemplo models/ratio3_pw1.pt.
     path.parent.mkdir(parents=True, exist_ok=True)
     # Agrupa pesos, scaler y metadata en un único archivo portable.
     checkpoint = {
@@ -215,6 +223,10 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
             "channels": scaler_stats["channels"],
             "median": torch.as_tensor(scaler_stats["median"], dtype=torch.float64).cpu(),
             "iqr": torch.as_tensor(scaler_stats["iqr"], dtype=torch.float64).cpu(),
+            "protocol_version": scaler_stats.get("protocol_version"),
+            "split_id": scaler_stats.get("split_id"),
+            "scaler_id": scaler_stats.get("scaler_id"),
+            "preprocessing_config": scaler_stats.get("preprocessing_config"),
         },
         "threshold": THRESHOLD,
         "op_threshold": op_threshold,
@@ -232,43 +244,15 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
         "neg_pos_ratio": neg_pos_ratio,
-        # Guarda la identidad del split y del fold para evitar evaluaciones cruzadas.
-        "cv_fold": cv_fold,
-        "cv_n_folds": cv_n_folds,
-        "final_train": final_train,
+        "noise_std": noise_std,
+        "protocol_version": PROTOCOL_VERSION,
+        "split_id": experiment_config.get("split_id") if experiment_config else None,
+        "scaler_id": experiment_config.get("scaler_id") if experiment_config else None,
+        "experiment_config": experiment_config,
         "seed": seed,
     }
     # Serializa el checkpoint; desde este momento la ruta representa un modelo válido.
     torch.save(checkpoint, path)
-
-
-def save_oof_artifacts(path: Path, probs, labels, dataset) -> tuple[Path, Path]:
-    """Guarda predicciones out-of-fold y el contexto temporal de sus ventanas."""
-    # Asegura que los índices globales estén disponibles antes de serializarlos.
-    dataset._ensure_index()
-    # El archivo binario contiene arrays numéricos usados para seleccionar el threshold.
-    npz_path = path.with_suffix(".oof.npz")
-    np.savez_compressed(
-        npz_path,
-        probs=np.asarray(probs, dtype=np.float32),
-        labels=np.asarray(labels, dtype=np.int8),
-        file_ids=np.asarray(dataset.file_ids, dtype=np.int32),
-        local_ids=np.asarray(dataset.local_ids, dtype=np.int32),
-    )
-    # El JSON contiene nombres de archivos y anotaciones necesarias para métricas de evento.
-    meta_path = path.with_suffix(".oof.json")
-    valid_names = [str(file_path.name) for file_path in dataset.valid_files]
-    annotations = {
-        name: dataset.annotations.get(name, []) for name in valid_names
-    }
-    meta_path.write_text(
-        json.dumps(
-            {"valid_files": valid_names, "annotations": annotations},
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return npz_path, meta_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -285,10 +269,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=PATIENCE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
+    parser.add_argument("--noise-std", type=float, default=NOISE_STD,
+                        help="Desvío del ruido gaussiano sumado a las ventanas de crisis (clase minoritaria). 0 lo desactiva.")
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Peso de la clase positiva en el loss. Default: igual a NEG_POS_RATIO.")
     parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
-                        help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor FDR que la alcance.")
+                        help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor tasa de falsas alarmas/h que la alcance.")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
@@ -309,6 +295,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num-workers no puede ser negativo")
     if args.neg_pos_ratio <= 0:
         parser.error("--neg-pos-ratio debe ser mayor que cero")
+    if args.noise_std < 0:
+        parser.error("--noise-std no puede ser negativo")
+    if not math.isfinite(args.noise_std):
+        parser.error("--noise-std debe ser finito")
     if args.pos_weight is not None and args.pos_weight <= 0:
         parser.error("--pos-weight debe ser mayor que cero")
     for name, value in (
@@ -345,23 +335,47 @@ def main() -> None:
     # Carga del split y de las stats del escalador
     # Carga el reparto de pacientes usado para esta corrida.
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
-    # Los folds generados por cross_validation.py guardan estos dos campos.
-    cv_fold = split.get("cv_fold")
-    cv_n_folds = split.get("cv_n_folds")
     scaler_stats = load_scaler_stats(Path(args.scaler_stats))
     if scaler_stats is None:
         sys.exit(
             f"No existe el scaler indicado: {args.scaler_stats}. "
             "Corré primero python -m src.preprocessing --compute-stats."
         )
+    expected_split_id = split_id(split)
+    expected_scaler_id = scaler_id(scaler_stats)
+    if scaler_stats.get("split_id") != expected_split_id:
+        sys.exit(
+            "El scaler no corresponde al split indicado "
+            f"(esperado {expected_split_id}, recibido {scaler_stats.get('split_id')}). "
+            "Regenerá scaler_stats.npz con ese split."
+        )
+    if scaler_stats.get("scaler_id") != expected_scaler_id:
+        sys.exit("El scaler_stats.npz está internamente inconsistente; regeneralo.")
 
     loaders = build_splits_dataloaders(args.data_dir, split, scaler_stats, batch_size=args.batch_size,
-        num_workers=args.num_workers, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed, limit_files=args.limit_files,)
+        num_workers=args.num_workers, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
+        noise_std=args.noise_std, limit_files=args.limit_files,)
     #solo uso esto para tener info del dataset e imprimirlo. Sino uso el dataloader
     train_ds = loaders["train"]["dataset"]
     train_loader = loaders["train"]["dataloader"]
     val_ds = loaders["val"]["dataset"]
     val_loader = loaders["val"]["dataloader"]
+
+    audit = {
+        name: bundle["dataset"].audit_summary()
+        for name, bundle in loaders.items()
+    }
+    for name, summary in audit.items():
+        print(
+            f"{name}: {summary['valid_files']}/{summary['input_files']} archivos válidos, "
+            f"{summary['windows']} ventanas ({summary['positive_windows']} positivas)"
+        )
+        if summary["skipped_files"]:
+            print(f"  [WARN] {name}: {len(summary['skipped_files'])} archivos descartados")
+    audit_path = Path(args.out).with_name(Path(args.out).stem + ".audit.json")
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8")
+    backup_file(audit_path, args.backup_dir)
 
     if len(train_ds) == 0:
         sys.exit("El split TRAIN no contiene ventanas procesables.")
@@ -374,10 +388,44 @@ def main() -> None:
 
     pos_weight = args.pos_weight if args.pos_weight is not None else compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
 
+    model_config = {
+        "in_channels": N_CHANNELS,
+        "conv_channels": list(CONV_CHANNELS),
+        "conv_kernels": list(CONV_KERNELS),
+        "fc_units": FC_UNITS,
+        "dropout": DROPOUT,
+    }
+    event_config = {
+        "n_within": POSITIVES_FOR_EVENT,
+        "n_window": WINDOW_RANGE_FOR_EVENT,
+        "min_alarm_interval": EVENT_MIN_ALARM_INTERVAL,
+        "max_latency": EVENT_MAX_LATENCY,
+    }
+    experiment_config = compatibility_config(
+        split,
+        scaler_stats,
+        model_config=model_config,
+        event_config=event_config,
+        min_event_sensitivity=args.min_event_sensitivity,
+        threshold_grid=THRESHOLD_GRID,
+        seed=args.seed,
+    )
+    experiment_config["scenario"] = {
+        "neg_pos_ratio": float(args.neg_pos_ratio),
+        "pos_weight": float(pos_weight),
+        "noise_std": float(args.noise_std),
+        "learning_rate": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "batch_size": int(args.batch_size),
+        "epochs": int(args.epochs),
+        "patience": int(args.patience),
+    }
+
     print(f"\nConfiguración de entrenamiento")
     print(f"Train: {len(train_ds)} ventanas ({train_ds.n_positive} positivas, "
           f"{len(train_ds) - train_ds.n_positive} negativas)")
     print(f"pos_weight: {pos_weight:.1f}  |  NEG_POS_RATIO: {args.neg_pos_ratio}")
+    print(f"split_id: {experiment_config['split_id']}  |  scaler_id: {experiment_config['scaler_id']}")
     print(f"batch_size={args.batch_size}  lr={args.lr}  weight_decay={args.weight_decay}  "
           f"epochs={args.epochs}  patience={args.patience}")
 
@@ -405,7 +453,7 @@ def main() -> None:
     # Loop de entrenamiento con early stopping si no mejora en X cantidad de épocas.
     # El criterio de "mejor" es CLÍNICO y a nivel EVENTO, no el loss crudo: entre los
     # umbrales cuya sensibilidad de CRISIS >= MIN_EVENT_SENSITIVITY se elige el de
-    # MENOR FDR (falsas detecciones / hora). Ver PLAN_MVP §3.7.2.
+    # MENOR tasa de falsas alarmas por hora.
     best_val_loss = float("inf")   # solo de referencia (se sigue guardando en el log)
     best_fdr = float("inf")
     best_op_threshold = THRESHOLD  # umbral del mejor punto de operación
@@ -419,7 +467,7 @@ def main() -> None:
     history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
 
     print(f"\n=== Entrenamiento ({args.epochs} épocas máx.) ===")
-    print(f"Criterio de selección: menor FDR con sens de crisis >= {args.min_event_sensitivity}")
+    print(f"Criterio de selección: menor tasa de falsas alarmas/h con sens de crisis >= {args.min_event_sensitivity}")
     print(f"La tabla de abajo es a nivel VENTANA @ umbral {THRESHOLD} (solo referencia).")
     print(f"{'Ep':>3} | {'train_loss':>12} | {'val_loss':>12} | {'sens':>10} | {'spec':>10} | "
           f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
@@ -442,7 +490,7 @@ def main() -> None:
         )
 
         # --- PUNTO DE OPERACIÓN A NIVEL EVENTO (criterio clínico de selección) ---
-        # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR FDR.
+            # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR tasa de falsas alarmas/h.
         op_ev, op_threshold = select_event_operating_point(
             probs, labels,
             file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
@@ -454,15 +502,15 @@ def main() -> None:
 
         if op_ev is not None:
             ev = op_ev
-            op_fdr = op_ev["false_detection_per_hour"]
+            op_fdr = op_ev["event_false_alarms_per_hour"]
             op_sensibility = op_ev["sensibility"]
             warn_msg = None
         else:
             # ningún umbral alcanza el objetivo de sensibilidad de CRISIS -> fallback:
             # mostramos el umbral con la MÁXIMA sensibilidad de crisis alcanzable, y
-            # marcamos FDR=inf para que este modelo NO pueda ser seleccionado.
+            # marcamos la tasa=inf para que este modelo NO pueda ser seleccionado.
             ev = None
-            for _t in np.arange(0.05, 1.0, 0.05):
+            for _t in THRESHOLD_GRID:
                 _e = event_metrics(probs, labels,
                                    file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
                                    valid_files=val_ds.valid_files, annotations=val_ds.annotations,
@@ -487,7 +535,7 @@ def main() -> None:
         print(f"      ventana @ {THRESHOLD:.2f} : sens={m['sensibility']:.3f}  spec={m['specificity']:.3f}  "
               f"fp/h={m['false_positive_per_hour']:.1f}  F1={m['f1']:.3f}  MCC={m['mcc']:.3f}")
         print(f"      evento  @ {op_threshold:.2f} : sens={op_sensibility:.3f} "
-              f"({ev['n_detected']}/{ev['n_seizures']} crisis)  FDR={ev['false_detection_per_hour']:.1f}/h  "
+              f"({ev['n_detected']}/{ev['n_seizures']} crisis)  falsas alarmas={ev['event_false_alarms_per_hour']:.1f}/h  "
               f"latencia={ev['latency_mean']:.1f}s")
         if warn_msg is not None:
             print(f"      [WARN] {warn_msg}")
@@ -508,12 +556,13 @@ def main() -> None:
             "op_sensibility": op_sensibility,
             "op_fdr_per_hour": op_fdr,
             "event_sensibility": ev["sensibility"],
-            "event_fdr_per_hour": ev["false_detection_per_hour"],
+            "event_false_alarms_per_hour": ev["event_false_alarms_per_hour"],
+            "event_fdr_per_hour": ev["event_false_alarms_per_hour"],
             "event_latency_mean": ev["latency_mean"],
             "time_s": elapsed_time_for_epoch,
         })
 
-        # si el punto de operación EVENTO mejoró (menor FDR con sens de crisis >= objetivo)
+        # si el punto de operación EVENTO mejoró (menor tasa de falsas alarmas/h con sens >= objetivo)
         improved = op_ev is not None and op_fdr < best_fdr
         if improved:
             best_fdr = op_fdr
@@ -526,23 +575,21 @@ def main() -> None:
                 Path(args.out), model, scaler_stats,
                 epoch=epoch, best_val_loss=best_val_loss,
                 pos_weight=pos_weight, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
-                cv_fold=cv_fold, cv_n_folds=cv_n_folds,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
                 min_event_sensitivity=args.min_event_sensitivity,
+                noise_std=args.noise_std,
+                experiment_config=experiment_config,
             )
-            # Guarda las predicciones de la validación de esta mejor época para
-            # construir luego una validación out-of-fold global.
-            save_oof_artifacts(Path(args.out), probs, labels, val_ds)
             # Solo se marca como guardado después de que torch.save terminó bien.
             checkpoint_saved = True
             backup_file(Path(args.out), args.backup_dir)
             print(f"    -> mejor punto de operación (evento): sens={op_sensibility:.3f}, "
-                  f"FDR={op_fdr:.3f}/h @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
+                  f"falsas alarmas={op_fdr:.3f}/h @ umbral {op_threshold:.2f}. Checkpoint en {args.out}")
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping: no mejoró el FDR (sens de crisis >= {args.min_event_sensitivity}) "
+                print(f"Early stopping: no mejoró la tasa de falsas alarmas/h (sens de crisis >= {args.min_event_sensitivity}) "
                       f"en {args.patience} épocas. Cortando.")
                 break
 
@@ -550,9 +597,9 @@ def main() -> None:
 
     total_time = time.time() - start
     print(f"\n=== Fin del entrenamiento ===")
-    print(f"Mejor época (por menor FDR con sens de crisis >= {args.min_event_sensitivity}): {best_epoch}")
+    print(f"Mejor época (por menor tasa de falsas alarmas/h con sens de crisis >= {args.min_event_sensitivity}): {best_epoch}")
     print(f"  val_loss de esa época: {best_val_loss:.6f}")
-    print(f"  punto de operación: umbral={best_op_threshold:.2f}  sens={best_op_sensibility:.3f}  FDR={best_fdr:.3f}/h")
+    print(f"  punto de operación: umbral={best_op_threshold:.2f}  sens={best_op_sensibility:.3f}  falsas alarmas={best_fdr:.3f}/h")
     print(f"Tiempo total: {total_time / 60:.1f} min")
     # No se imprime una ruta si esta corrida no creó un checkpoint.
     if checkpoint_saved:
@@ -570,16 +617,19 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "best_fdr_per_hour": best_fdr,
+        "best_event_false_alarms_per_hour": best_fdr,
         "best_op_threshold": best_op_threshold,
         "best_op_sensibility": best_op_sensibility,
         "min_event_sensitivity": args.min_event_sensitivity,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,
         "neg_pos_ratio": args.neg_pos_ratio,
-        "cv_fold": cv_fold,
-        "cv_n_folds": cv_n_folds,
+        "noise_std": args.noise_std,
+        "protocol_version": PROTOCOL_VERSION,
+        "split_id": experiment_config["split_id"],
+        "scaler_id": experiment_config["scaler_id"],
+        "experiment_config": experiment_config,
         "checkpoint_saved": checkpoint_saved,
-        "oof_saved": checkpoint_saved,
         "learning_rate": args.lr,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,

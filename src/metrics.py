@@ -4,13 +4,13 @@ Métricas de evaluación para detección de crisis.
 Sigue la convención de los papers del marco teórico:
 
   - Nivel SEGMENTO (ventana): sensibilidad, especificidad, accuracy, AUC y fp/hora.
-  - Nivel EVENTO (crisis): sensibilidad + FDR (falsas detecciones / hora) + latencia,
+  - Nivel EVENTO (crisis): sensibilidad + tasa de falsas alarmas por hora + latencia,
     con postprocesado "n positivos en N ventanas consecutivas" + intervalo mínimo
     entre alarmas (IEEE TNSRE 2025, "EEG-Based Seizure Onset Detection ... 1DCNN").
 
 También expone:
   - `threshold_sweep`: la curva sensibilidad <-> fp/h barriendo umbrales.
-  - `select_operating_point`: el umbral con MENOR fp/h que cumpla sensibilidad >= objetivo
+  - `select_operating_point`: el umbral con MENOR tasa de falsas alarmas por hora que cumpla sensibilidad >= objetivo
     (lo que se usa para elegir el mejor checkpoint en train.py).
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 import numpy as np
 
 from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.protocol import THRESHOLD_GRID
 from src.timing import decision_times_from_local_ids
 
 
@@ -102,7 +103,7 @@ def threshold_sweep(probs, labels, thresholds=None, *, file_ids=None, local_ids=
     probs = np.asarray(probs).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
     if thresholds is None:
-        thresholds = np.arange(0.05, 1.0, 0.05)
+        thresholds = THRESHOLD_GRID
     total_hours = (
         _span_hours_by_file(file_ids, local_ids)
         if file_ids is not None and local_ids is not None
@@ -154,7 +155,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
       [onset, onset + max_latency].
     - Latencia = tiempo desde el onset de la crisis hasta su primera alarma.
 
-    Devuelve sensibilidad (evento), falsas detecciones por hora de registro
+    Devuelve sensibilidad (evento), falsas alarmas por hora de registro
     cubierto, latencia media y mediana, y conteos crudos.
     """
     probs = np.asarray(probs).reshape(-1)
@@ -196,12 +197,15 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
     n_false_alarms = 0
     n_alarms = 0
     latencies: list[float] = []
+    by_patient: dict[str, dict] = {}
 
     for fid, path in enumerate(valid_files):
         seizures = annotations.get(path.name, [])
         file_alarms = sorted(alarms_by_file.get(fid, []))
         n_alarms += len(file_alarms)
         matched = [False] * len(file_alarms)
+        file_detected = 0
+        file_latencies: list[float] = []
         for onset, _end in seizures:
             n_seizures += 1
             det_time = None
@@ -214,12 +218,56 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
                     break
             if det_time is not None:
                 n_detected += 1
-                latencies.append(det_time - onset)
-        n_false_alarms += sum(1 for k in range(len(file_alarms)) if not matched[k])
+                latency = det_time - onset
+                latencies.append(latency)
+                file_latencies.append(latency)
+                file_detected += 1
+        file_false_alarms = sum(1 for k in range(len(file_alarms)) if not matched[k])
+        n_false_alarms += file_false_alarms
 
+        patient = path.parent.name
+        patient_metrics = by_patient.setdefault(patient, {
+            "n_files": 0,
+            "n_seizures": 0,
+            "n_detected": 0,
+            "n_alarms": 0,
+            "n_false_alarms": 0,
+            "hours": 0.0,
+            "latencies": [],
+        })
+        patient_metrics["n_files"] += 1
+        patient_metrics["n_seizures"] += len(seizures)
+        patient_metrics["n_detected"] += file_detected
+        patient_metrics["n_alarms"] += len(file_alarms)
+        patient_metrics["n_false_alarms"] += file_false_alarms
+        patient_metrics["hours"] += _span_hours(int(local_ids[file_ids == fid].max()) + 1)
+        patient_metrics["latencies"].extend(file_latencies)
+
+    for patient_metrics in by_patient.values():
+        patient_metrics["sensitivity"] = (
+            patient_metrics["n_detected"] / patient_metrics["n_seizures"]
+            if patient_metrics["n_seizures"] > 0 else 0.0
+        )
+        patient_metrics["false_alarms_per_hour"] = (
+            patient_metrics["n_false_alarms"] / patient_metrics["hours"]
+            if patient_metrics["hours"] > 0 else 0.0
+        )
+        patient_metrics["latency_mean"] = (
+            float(np.mean(patient_metrics["latencies"]))
+            if patient_metrics["latencies"] else 0.0
+        )
+        patient_metrics["latency_median"] = (
+            float(np.median(patient_metrics["latencies"]))
+            if patient_metrics["latencies"] else 0.0
+        )
+        del patient_metrics["latencies"]
+
+    event_false_alarms_per_hour = n_false_alarms / total_hours if total_hours > 0 else 0.0
     return {
         "sensibility": n_detected / n_seizures if n_seizures > 0 else 0.0,
-        "false_detection_per_hour": n_false_alarms / total_hours if total_hours > 0 else 0.0,
+        "event_false_alarms_per_hour": event_false_alarms_per_hour,
+        # Alias de lectura para historiales generados por versiones anteriores.
+        "false_detection_per_hour": event_false_alarms_per_hour,
         "latency_mean": float(np.mean(latencies)) if latencies else 0.0,
         "latency_median": float(np.median(latencies)) if latencies else 0.0,
         "n_seizures": n_seizures,
@@ -227,6 +275,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         "n_alarms": n_alarms,
         "n_false_alarms": n_false_alarms,
         "total_hours": total_hours,
+        "by_patient": by_patient,
     }
 
 
@@ -236,10 +285,10 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
                                   thresholds=None) -> tuple[dict | None, float | None]:
     """
     Punto de operación a nivel EVENTO: entre los umbrales cuya sensibilidad de CRISIS
-    >= `min_sensibility`, el de MENOR FDR (falsas detecciones / hora).
+    >= `min_sensibility`, el de MENOR tasa de falsas alarmas por hora.
 
     Recorre la misma malla de umbrales que `threshold_sweep`, evalúa cada uno con
-    `event_metrics` y se queda con el mejor (menor FDR) que cumpla el objetivo de
+    `event_metrics` y se queda con el mejor (menor tasa de falsas alarmas por hora) que cumpla el objetivo de
     sensibilidad de crisis.
 
     Devuelve (event_metrics, threshold) del punto elegido, o (None, None) si ningún
@@ -248,7 +297,7 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
     probs = np.asarray(probs).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
     if thresholds is None:
-        thresholds = np.arange(0.05, 1.0, 0.05)
+        thresholds = THRESHOLD_GRID
 
     best: dict | None = None
     best_threshold: float | None = None
@@ -258,7 +307,7 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
                            n_within=n_within, n_window=n_window,
                            min_alarm_interval=min_alarm_interval, max_latency=max_latency)
         if ev["sensibility"] >= min_sensibility:
-            if best is None or ev["false_detection_per_hour"] < best["false_detection_per_hour"]:
+            if best is None or ev["event_false_alarms_per_hour"] < best["event_false_alarms_per_hour"]:
                 best = ev
                 best_threshold = float(t)
     return best, best_threshold

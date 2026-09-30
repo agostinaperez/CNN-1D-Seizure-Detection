@@ -72,7 +72,7 @@ SEED = 42
 
 # Split por paciente (inter-paciente, 70/30 proporcional)
 TEST_RATIO = 0.30
-N_VAL_PATIENTS = 4 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
+N_VAL_PATIENTS = 3 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
 
 # Peso relativo de los SEGUNDOS DE CRISIS frente a los ARCHIVOS en el reparto
 # codicioso del split. Los segundos de crisis determinan cuántas ventanas
@@ -108,12 +108,19 @@ NEG_POS_RATIO = 3
 # Dropout para regularización del modelo.
 DROPOUT = 0.4 #en cada lote apaga al 40% de las neuronas al azar, así no se sobreajusta
 
+# Augmentación con ruido gaussiano (paper 1DCNN IEEE TNSRE 2025): se suma ruido
+# N(0, NOISE_STD) SOLO a las ventanas de crisis (clase minoritaria) durante el train.
+# El desvío está en unidades de la señal ya escalada (RobustScaler: mediana~0, IQR~1).
+# NOISE_STD=0 desactiva el ruido.
+NOISE_STD = 0.1
+
 # Umbral de decisión de la clasificación binaria:
 #la red no devuelve un sí o un no, sino un valor entre 0 y 1, q es la probabilidad de q haya crisis. Si la probabilidad es mayor al
 #treshold, se considera q la red predijo crisis. Es ajustable para priorizar sensibilidad o especificidad
 THRESHOLD = 0.75
 
-# Sensibilidad objetivo a nivel EVENTO, criterio con el que se elige elmejor checkpoint. Entre todos los umbrales cuya sensibilidad de CRISIS >= este valor, se elige el de MENOR FDR (falsas detecciones / hora). 
+# Sensibilidad objetivo a nivel EVENTO. Entre los umbrales cuya sensibilidad de
+# CRISIS >= este valor, se elige el de MENOR tasa de falsas alarmas por hora.
 MIN_EVENT_SENSITIVITY = 0.9
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
