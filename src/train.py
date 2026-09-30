@@ -35,19 +35,17 @@ from src.config import (
     CONV_CHANNELS,
     CONV_KERNELS,
     DATASET_DIR,
-    DECISION_TIME_MODE,
     DROPOUT,
     EPOCHS,
     EVENT_MAX_LATENCY,
     EVENT_MIN_ALARM_INTERVAL,
-    EVENT_N_WINDOW,
-    EVENT_N_WITHIN,
+    WINDOW_RANGE_FOR_EVENT,
+    POSITIVES_FOR_EVENT,
     FC_UNITS,
     GRAD_CLIP,
     LEARNING_RATE,
     LR_MIN,
     MIN_EVENT_SENSITIVITY,
-    MIN_SENSITIVITY,
     MODELS_DIR,
     N_CHANNELS,
     NEG_POS_RATIO,
@@ -60,8 +58,7 @@ from src.config import (
     WEIGHT_DECAY,
 )
 from src.data import build_splits_dataloaders, compute_positive_weight
-from src.cross_validation import split_signature
-from src.metrics import binary_metrics, event_metrics, select_event_operating_point, select_operating_point, threshold_sweep
+from src.metrics import binary_metrics, event_metrics, select_event_operating_point
 from src.model import SeizureCNN
 from src.preprocessing import load_scaler_stats
 
@@ -177,7 +174,6 @@ def evaluate(model: nn.Module, loader, criterion, device: str) -> tuple[float, t
 def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     epoch: int, best_val_loss: float, pos_weight: float, seed: int,
                     neg_pos_ratio: float = NEG_POS_RATIO,
-                    split_signature_value: str | None = None,
                     cv_fold: int | None = None,
                     cv_n_folds: int | None = None,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
@@ -205,7 +201,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
     path.parent.mkdir(parents=True, exist_ok=True)
     # Agrupa pesos, scaler y metadata en un único archivo portable.
     checkpoint = {
-        "format_version": 2,
+        "format_version": 3,
         "model_state_dict": model.state_dict(),
         "model_config": {
             "in_channels": N_CHANNELS,
@@ -226,8 +222,8 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "op_fdr_per_hour": op_fdr_per_hour,
         # Guarda las reglas que convierten predicciones de ventana en alarmas.
         "event_config": {
-            "n_within": EVENT_N_WITHIN,
-            "n_window": EVENT_N_WINDOW,
+            "n_within": POSITIVES_FOR_EVENT,
+            "n_window": WINDOW_RANGE_FOR_EVENT,
             "min_alarm_interval": EVENT_MIN_ALARM_INTERVAL,
             "max_latency": EVENT_MAX_LATENCY,
             "min_event_sensitivity": min_event_sensitivity,
@@ -236,9 +232,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
         "best_val_loss": best_val_loss,
         "pos_weight": pos_weight,
         "neg_pos_ratio": neg_pos_ratio,
-        "decision_time_mode": DECISION_TIME_MODE,
         # Guarda la identidad del split y del fold para evitar evaluaciones cruzadas.
-        "split_signature": split_signature_value,
         "cv_fold": cv_fold,
         "cv_n_folds": cv_n_folds,
         "final_train": final_train,
@@ -293,8 +287,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Peso de la clase positiva en el loss. Default: igual a NEG_POS_RATIO.")
-    parser.add_argument("--min-sensitivity", type=float, default=MIN_SENSITIVITY,
-                        help="Sensibilidad objetivo a nivel VENTANA (solo display/curva, no selecciona).")
     parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
                         help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor FDR que la alcance.")
     parser.add_argument("--seed", type=int, default=SEED)
@@ -320,7 +312,6 @@ def parse_args() -> argparse.Namespace:
     if args.pos_weight is not None and args.pos_weight <= 0:
         parser.error("--pos-weight debe ser mayor que cero")
     for name, value in (
-        ("--min-sensitivity", args.min_sensitivity),
         ("--min-event-sensitivity", args.min_event_sensitivity),
     ):
         if not 0.0 <= value <= 1.0:
@@ -354,8 +345,6 @@ def main() -> None:
     # Carga del split y de las stats del escalador
     # Carga el reparto de pacientes usado para esta corrida.
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
-    # Firma el reparto para poder comprobarlo al evaluar.
-    split_signature_value = split_signature(split)
     # Los folds generados por cross_validation.py guardan estos dos campos.
     cv_fold = split.get("cv_fold")
     cv_n_folds = split.get("cv_n_folds")
@@ -451,12 +440,6 @@ def main() -> None:
             file_ids=val_ds.file_ids,
             local_ids=val_ds.local_ids,
         )
-        curve = threshold_sweep(
-            probs,
-            labels,
-            file_ids=val_ds.file_ids,
-            local_ids=val_ds.local_ids,
-        )
 
         # --- PUNTO DE OPERACIÓN A NIVEL EVENTO (criterio clínico de selección) ---
         # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR FDR.
@@ -465,9 +448,8 @@ def main() -> None:
             file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
             valid_files=val_ds.valid_files, annotations=val_ds.annotations,
             min_sensibility=args.min_event_sensitivity,
-            n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
+            n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
             min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
-            decision_time_mode=DECISION_TIME_MODE,
         )
 
         if op_ev is not None:
@@ -485,10 +467,9 @@ def main() -> None:
                                    file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
                                    valid_files=val_ds.valid_files, annotations=val_ds.annotations,
                                    threshold=_t,
-                                   n_within=EVENT_N_WITHIN, n_window=EVENT_N_WINDOW,
+                                   n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
                                    min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
-                                   max_latency=EVENT_MAX_LATENCY,
-                                   decision_time_mode=DECISION_TIME_MODE)
+                                   max_latency=EVENT_MAX_LATENCY)
                 if ev is None or _e["sensibility"] > ev["sensibility"]:
                     ev = _e
                     op_threshold = float(_t)
@@ -496,14 +477,6 @@ def main() -> None:
             op_sensibility = ev["sensibility"]
             warn_msg = (f"ningún umbral alcanzó sens de crisis >= {args.min_event_sensitivity} "
                         f"(máximo logrado: {op_sensibility:.3f} @ umbral {op_threshold:.2f})")
-
-        # trade-off sens <-> fp/h a lo largo de los umbrales (nivel VENTANA, solo
-        # referencia): para cada sens objetivo, el menor fp/h que la alcanza.
-        _levels = (0.5, 0.6, 0.7, 0.8, 0.9)
-        _trade = []
-        for _lv in _levels:
-            _o = select_operating_point(curve, _lv)
-            _trade.append("--" if _o is None else f"{_o['false_positive_per_hour']:.1f} fp/h @ {_o['threshold']:.2f}")
 
         elapsed_time_for_epoch = time.time() - t_epoch
 
@@ -516,8 +489,6 @@ def main() -> None:
         print(f"      evento  @ {op_threshold:.2f} : sens={op_sensibility:.3f} "
               f"({ev['n_detected']}/{ev['n_seizures']} crisis)  FDR={ev['false_detection_per_hour']:.1f}/h  "
               f"latencia={ev['latency_mean']:.1f}s")
-        print(f"      trade-off (ventana):  sens>=0.5 -> {_trade[0]}   >=0.6 -> {_trade[1]}   "
-              f">=0.7 -> {_trade[2]}   >=0.8 -> {_trade[3]}   >=0.9 -> {_trade[4]}")
         if warn_msg is not None:
             print(f"      [WARN] {warn_msg}")
         print()
@@ -555,7 +526,6 @@ def main() -> None:
                 Path(args.out), model, scaler_stats,
                 epoch=epoch, best_val_loss=best_val_loss,
                 pos_weight=pos_weight, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
-                split_signature_value=split_signature_value,
                 cv_fold=cv_fold, cv_n_folds=cv_n_folds,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
@@ -603,12 +573,9 @@ def main() -> None:
         "best_op_threshold": best_op_threshold,
         "best_op_sensibility": best_op_sensibility,
         "min_event_sensitivity": args.min_event_sensitivity,
-        "min_sensitivity": args.min_sensitivity,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,
         "neg_pos_ratio": args.neg_pos_ratio,
-        "decision_time_mode": DECISION_TIME_MODE,
-        "split_signature": split_signature_value,
         "cv_fold": cv_fold,
         "cv_n_folds": cv_n_folds,
         "checkpoint_saved": checkpoint_saved,

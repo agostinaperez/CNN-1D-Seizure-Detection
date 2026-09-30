@@ -165,6 +165,25 @@ def filter_bandpass(data: np.ndarray, fs: int = FS, low: float = LOW_FREQ, high:
     """
     Butterworth pasa-banda offline con fase 0 para evitar distorsion temporal.
     Filtra a lo largo del eje 1 de cada canal.
+
+    Usa `sosfiltfilt`, que es NO CAUSAL: filtra de izquierda a derecha y después de derecha
+    a izquierda. Eso tiene dos consecuencias, y conviene no confundirlas:
+
+      - NO agrega latencia. La fase cero implica retardo cero, y por eso el transitorio
+        queda CENTRADO en el borde en lugar de acumularse. El costo en latencia del
+        filtrado es exactamente 0 s. Toda la latencia del sistema viene de la CNN
+        (WIN_SECONDS_EFFECTIVE = 5.117 s), no de acá. Un `sosfilt` causal agregaría solo
+        ~11.85 ms de retardo de grupo, o sea un 0.23%: la elección entre ambos es
+        numéricamente irrelevante para el reporte de latencia.
+      - SÍ usa información del futuro, pero únicamente en los bordes de cada EDF: el
+        transitorio de borde se extiende ~12.93 s desde el inicio (y otros tantos desde
+        el final), y después de eso la salida es idéntica a la de un filtro con historial
+        infinito. Sobre un EDF de 3600 s eso es 0.36% del archivo.
+
+    Ojo también con el orden: `order` es el orden de diseño, pero la doble pasada de
+    `sosfiltfilt` CUADRA la respuesta en magnitud, así que el orden efectivo es el doble
+    (con order=5 el filtro real tiene orden efectivo 10). Ver la nota de FILTER_ORDER en
+    config.py.
     """
     
     if fs <= 0 or order <= 0 or not 0 < low < high < fs / 2:
@@ -177,8 +196,11 @@ def filter_bandpass(data: np.ndarray, fs: int = FS, low: float = LOW_FREQ, high:
     #Eentonces aplica filtritos seguidos
     butterworth_filter = scipy.signal.butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
     #acá agarro el filtro y se lo paso a mis datos en la dimensión 1 (el del tiempo, pq la dimensión 0 son los canales)
-    #ese sosfiltfitl básicmanete hace que sea de "fase 0", porque filtra de izq a derecha y desp de derecha a izq cosa de anular
-    #cualquier desfase temporal
+    #`sosfiltfilt` es la versión de fase cero: filtra de izq a derecha, después invierte y
+    #filtra de derecha a izq, y así se anula el desfase temporal. Por eso NO retarda la señal.
+    #El precio es que no es causal (mira al futuro) y que aplica el filtro DOS veces, con lo
+    #que la respuesta en magnitud queda al cuadrado. Todo esto está cuantificado en el
+    #docstring de la función.
     return scipy.signal.sosfiltfilt(butterworth_filter, data, axis=1)
 
 

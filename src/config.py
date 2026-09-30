@@ -41,16 +41,13 @@ WIN_SAMPLES_USED = WIN_SAMPLES
 OVERLAP = 0.5
 # Paso (stride) entre inicios de ventana: 50% de la ventana = 655 muestras.
 STRIDE_SAMPLES = int(WIN_SAMPLES_USED * (1.0 - OVERLAP))
-
-# Convención temporal para el procesamiento offline de EDFs pregrabados. La
-# predicción de una ventana se reporta en su extremo final.
-DECISION_TIME_MODE = "window_end"
-
 # Filtrado pasabanda de frecuencias baja (0.5 Hz, deriva lenta) y alta (50 Hz, ruido de red).
 LOW_FREQ = 0.5
 HIGH_FREQ = 50.0
 
 # Orden del filtro Butterworth (5 es un buen compromiso entre pendiente y estabilidad numérica).
+# igual,5 no es el orden efectivo que realmente se aplica. sosfiltfilt filtra dos veces (adelante y atrás), y
+# por lo tanto CUADRA la respuesta en magnitud: el orden efectivo del filtro real es 10, atenuando el doble (mejor)
 FILTER_ORDER = 5 #q tan "bruscamente" se corta la señal
 
 # Escalado robusto por canal (RobustScaler de scikit-learn).
@@ -107,29 +104,22 @@ EPOCHS = 40
 PATIENCE = 8
 
 # Ratios de negative:positive en cada batch de train.Ej: 4 => 4 ventanas no-crisis por cada ventana de crisis.
-NEG_POS_RATIO = 4
+NEG_POS_RATIO = 3
 # Dropout para regularización del modelo.
 DROPOUT = 0.4 #en cada lote apaga al 40% de las neuronas al azar, así no se sobreajusta
 
 # Umbral de decisión de la clasificación binaria:
 #la red no devuelve un sí o un no, sino un valor entre 0 y 1, q es la probabilidad de q haya crisis. Si la probabilidad es mayor al
 #treshold, se considera q la red predijo crisis. Es ajustable para priorizar sensibilidad o especificidad
-THRESHOLD = 0.9
+THRESHOLD = 0.75
 
-# Sensibilidad objetivo (a nivel VENTANA) usada SOLO para el display/curva, no para
-# elegir el modelo. Sirve para marcar un punto de referencia sobre la curva sens <-> fp/h.
-MIN_SENSITIVITY = 0.5
-
-# Sensibilidad objetivo a nivel EVENTO (crisis): criterio con el que se elige el
-# mejor checkpoint. Entre todos los umbrales cuya sensibilidad de CRISIS >= este
-# valor, se elige el de MENOR FDR (falsas detecciones / hora). Es la métrica clínica
-# relevante (ver PLAN_MVP §3.7.2).
+# Sensibilidad objetivo a nivel EVENTO, criterio con el que se elige elmejor checkpoint. Entre todos los umbrales cuya sensibilidad de CRISIS >= este valor, se elige el de MENOR FDR (falsas detecciones / hora). 
 MIN_EVENT_SENSITIVITY = 0.9
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
-# dispara una alarma si hay >= EVENT_N_WITHIN predicciones positivas dentro de las últimas EVENT_N_WINDOW ventanas consecutivas.
-EVENT_N_WITHIN = 3
-EVENT_N_WINDOW = 4
+# dispara una alarma si hay >= POSITIVES_FOR_EVENT predicciones positivas dentro de las últimas WINDOW_RANGE_FOR_EVENT ventanas consecutivas.
+POSITIVES_FOR_EVENT = 3
+WINDOW_RANGE_FOR_EVENT = 4
 # Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
 EVENT_MIN_ALARM_INTERVAL = 30.0
 # Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].

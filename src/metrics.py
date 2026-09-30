@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.config import DECISION_TIME_MODE, FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
 from src.timing import decision_times_from_local_ids
 
 
@@ -141,8 +141,7 @@ def select_operating_point(curve: list[dict], min_sensibility: float) -> dict | 
 
 def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                   threshold: float, n_within: int = 3, n_window: int = 4,
-                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
-                  decision_time_mode: str = DECISION_TIME_MODE) -> dict:
+                  min_alarm_interval: float = 30.0, max_latency: float = 30.0) -> dict:
     """
     Evaluación a nivel EVENTO (crisis), como en el paper 1DCNN (IEEE TNSRE 2025).
 
@@ -176,7 +175,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         p = pred[idx]
         # La red ve la ventana completa. La convención offline ubica la decisión
         # cuando termina la ventana, no en su instante de inicio.
-        win_times = decision_times_from_local_ids(local_ids[idx], decision_time_mode)
+        win_times = decision_times_from_local_ids(local_ids[idx])
 
         alarm_times: list[float] = []
         last_alarm = -np.inf
@@ -234,8 +233,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
 def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                                  min_sensibility: float, n_within: int = 3, n_window: int = 4,
                                   min_alarm_interval: float = 30.0, max_latency: float = 30.0,
-                                  thresholds=None,
-                                  decision_time_mode: str = DECISION_TIME_MODE) -> tuple[dict | None, float | None]:
+                                  thresholds=None) -> tuple[dict | None, float | None]:
     """
     Punto de operación a nivel EVENTO: entre los umbrales cuya sensibilidad de CRISIS
     >= `min_sensibility`, el de MENOR FDR (falsas detecciones / hora).
@@ -258,8 +256,7 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
         ev = event_metrics(probs, labels, file_ids=file_ids, local_ids=local_ids,
                            valid_files=valid_files, annotations=annotations, threshold=t,
                            n_within=n_within, n_window=n_window,
-                           min_alarm_interval=min_alarm_interval, max_latency=max_latency,
-                           decision_time_mode=decision_time_mode)
+                           min_alarm_interval=min_alarm_interval, max_latency=max_latency)
         if ev["sensibility"] >= min_sensibility:
             if best is None or ev["false_detection_per_hour"] < best["false_detection_per_hour"]:
                 best = ev
