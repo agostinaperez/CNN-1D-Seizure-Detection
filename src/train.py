@@ -187,6 +187,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     op_fdr_per_hour: float = float("inf"),
                     min_event_sensitivity: float = MIN_EVENT_SENSITIVITY,
                     noise_std: float = NOISE_STD,
+                    dropout: float = DROPOUT,
                     experiment_config: dict | None = None) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar.
@@ -216,7 +217,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
             "conv_channels": list(CONV_CHANNELS),
             "conv_kernels": list(CONV_KERNELS),
             "fc_units": FC_UNITS,
-            "dropout": DROPOUT,
+            "dropout": dropout,
         },
         # Guarda el scaler del train exacto que produjo este modelo.
         "scaler_stats": {
@@ -271,6 +272,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
     parser.add_argument("--noise-std", type=float, default=NOISE_STD,
                         help="Desvío del ruido gaussiano sumado a las ventanas de crisis (clase minoritaria). 0 lo desactiva.")
+    parser.add_argument("--dropout", type=float, default=DROPOUT,
+                        help="Dropout del modelo (arquitectura). Debe estar en [0, 1).")
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Peso de la clase positiva en el loss. Default: igual a NEG_POS_RATIO.")
     parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
@@ -299,6 +302,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--noise-std no puede ser negativo")
     if not math.isfinite(args.noise_std):
         parser.error("--noise-std debe ser finito")
+    if not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout debe estar en [0, 1)")
     if args.pos_weight is not None and args.pos_weight <= 0:
         parser.error("--pos-weight debe ser mayor que cero")
     for name, value in (
@@ -393,7 +398,7 @@ def main() -> None:
         "conv_channels": list(CONV_CHANNELS),
         "conv_kernels": list(CONV_KERNELS),
         "fc_units": FC_UNITS,
-        "dropout": DROPOUT,
+        "dropout": args.dropout,
     }
     event_config = {
         "n_within": POSITIVES_FOR_EVENT,
@@ -427,9 +432,9 @@ def main() -> None:
     print(f"pos_weight: {pos_weight:.1f}  |  NEG_POS_RATIO: {args.neg_pos_ratio}")
     print(f"split_id: {experiment_config['split_id']}  |  scaler_id: {experiment_config['scaler_id']}")
     print(f"batch_size={args.batch_size}  lr={args.lr}  weight_decay={args.weight_decay}  "
-          f"epochs={args.epochs}  patience={args.patience}")
+          f"dropout={args.dropout}  epochs={args.epochs}  patience={args.patience}")
 
-    model = SeizureCNN().to(device)
+    model = SeizureCNN(dropout=args.dropout).to(device)
 
     # AdamW es Adam + weight decay DESACOPLADO (hat dos formas de meterlo: acoplado, agreganfo el castigo al gradiente, o el desacoplado)
     # El adam solito usa momentum y tasa adaptativa. El weight decay sirve para evitar el overfitting. Penaliza pesos
@@ -579,6 +584,7 @@ def main() -> None:
                 op_fdr_per_hour=op_fdr,
                 min_event_sensitivity=args.min_event_sensitivity,
                 noise_std=args.noise_std,
+                dropout=args.dropout,
                 experiment_config=experiment_config,
             )
             # Solo se marca como guardado después de que torch.save terminó bien.

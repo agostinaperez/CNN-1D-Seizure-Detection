@@ -28,6 +28,7 @@ from src.config import (
     PROCESSED_DIR,
     SPLIT_W_ZSEC,
     TEST_RATIO,
+    VAL_REQUIRED_PATIENTS,
 )
 from src.protocol import PROTOCOL_VERSION, split_id
 
@@ -109,31 +110,50 @@ def split_dataset(
     return train_patients, test_patients
 
 
-def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N_VAL_PATIENTS) -> list[str]:
+def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N_VAL_PATIENTS,
+                    required: list[str] | None = None) -> list[str]:
     """
     Elige N pacientes de validación DENTRO del conjunto de train.
 
-    se toman pacientes "del medio" en severidad para que la validación tenga una mezcla típica
-    de eventos. Si no alcanza el número pedido, se toma lo que haya.
+    - Primero se incluyen los pacientes OBLIGATORIOS (crisis cortas) para que
+      la validación sea representativa del caso difícil.
+    - El resto se toma en posiciones "centrales" de severidad para que la
+      validación tenga una mezcla típica de eventos.
     """
+    required = list(required or VAL_REQUIRED_PATIENTS)
+    if n_val < 0:
+        raise ValueError("n_val no puede ser negativo")
+
     # Mapa paciente -> severidad para ordenar.
     sev = {s["patient"]: s["seizure_seconds"] for s in stats}
 
-    # Ordenar los train por severidad ascendente (menos crisis -> más crisis).
-    train_sorted = sorted(train_patients, key=lambda p: sev.get(p, 0))
+    # Pacientes obligatorios que están disponibles en train.
+    forced = [p for p in required if p in train_patients]
+    missing = [p for p in required if p not in train_patients]
+    if missing:
+        print(f"[WARN] split.py: pacientes obligatorios de val no están en train: {missing}")
 
-    # Elegimos posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición
-    if n_val < 0:
-        raise ValueError("n_val no puede ser negativo")
-    if len(train_sorted) <= n_val:
+    if len(forced) > n_val:
         raise ValueError(
-            f"Se necesitan más pacientes de train que {n_val} para reservar validación; "
-            f"hay {len(train_sorted)}."
+            f"Hay más pacientes obligatorios de val ({len(forced)}) que plazas de "
+            f"validación ({n_val})."
         )
-    idx = [(k * len(train_sorted)) // (n_val + 1) for k in range(1, n_val + 1)]
 
-    # Tomamos las n_val posiciones centrales disponibles.
-    val = [train_sorted[i] for i in idx if i < len(train_sorted)]
+    # Resto de train sin los obligatorios, ordenado por severidad ascendente.
+    remaining = sorted([p for p in train_patients if p not in forced], key=lambda p: sev.get(p, 0))
+
+    n_extra = n_val - len(forced)
+    if len(remaining) < n_extra:
+        raise ValueError(
+            f"No alcanzan los pacientes de train para reservar {n_val} de validación "
+            f"({len(remaining)} disponibles después de los obligatorios)."
+        )
+
+    # posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición.
+    idx = [(k * len(remaining)) // (n_extra + 1) for k in range(1, n_extra + 1)] if n_extra else []
+    extras = [remaining[i] for i in idx if i < len(remaining)]
+
+    val = forced + extras
     return val[:n_val]
 
 
@@ -198,6 +218,7 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
         "data_dir": str(data_dir),
         "test_ratio_solicitado": TEST_RATIO,
         "n_val_patients_config": N_VAL_PATIENTS,
+        "val_required_patients": list(VAL_REQUIRED_PATIENTS),
         "split_w_zsec": SPLIT_W_ZSEC,
         "n_train": len(train_eff),
         "n_val": len(val),

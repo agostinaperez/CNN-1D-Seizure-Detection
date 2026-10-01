@@ -70,9 +70,12 @@ N_CHANNELS = len(CHANNELS_TUEV)
 # Semilla global para reproducibilidad (datos, batches e inicialización).
 SEED = 42
 
-# Split por paciente (inter-paciente, 70/30 proporcional)
-TEST_RATIO = 0.30
-N_VAL_PATIENTS = 3 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
+# Split por paciente (inter-paciente). TEST_RATIO bajo (0.21) apunta a ~6 pacientes
+# de test para liberar más pacientes al pool de desarrollo (train + val).
+TEST_RATIO = 0.21
+N_VAL_PATIENTS = 5 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
+# este paciente tiene q quedar en validación (val representativo de casos difíciles), este tiene crisis cortas que me hacen renegar así q las tiene q tener en cuenta para calibrar el umbral.
+VAL_REQUIRED_PATIENTS = ["chb14"]
 
 # Peso relativo de los SEGUNDOS DE CRISIS frente a los ARCHIVOS en el reparto
 # codicioso del split. Los segundos de crisis determinan cuántas ventanas
@@ -125,8 +128,9 @@ MIN_EVENT_SENSITIVITY = 0.9
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
 # dispara una alarma si hay >= POSITIVES_FOR_EVENT predicciones positivas dentro de las últimas WINDOW_RANGE_FOR_EVENT ventanas consecutivas.
-POSITIVES_FOR_EVENT = 3
-WINDOW_RANGE_FOR_EVENT = 4
+# 2-de-3: regla más sensible que 3-de-4, para no perder crisis cortas.
+POSITIVES_FOR_EVENT = 2
+WINDOW_RANGE_FOR_EVENT = 3
 # Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
 EVENT_MIN_ALARM_INTERVAL = 30.0
 # Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].
