@@ -1,11 +1,11 @@
 """
-Split inter-paciente 70/30 proporcional
+Split inter-paciente 80/20 proporcional
 
 Asigna pacientes COMPLETOS a Train/Val/Test para la generalización inter-paciente y q no haya fuga de datos.
 
 La asignación se hace por orden de "severidad" (segundos de crisis) para que train y test tengan una mezcla parecida de pacientes "graves" (con muchas crisis).
 Se usa una asignación codiciosa que mantiene, tanto en volumen de registro (n_files) como en duración de crisis (seizure_seconds), la fracción de test
-cerca de TEST_RATIO (30%).
+cerca de TEST_RATIO (20%).
 
 Salida: escribe data/processed/split.json con los conjuntos y el detalle.
 

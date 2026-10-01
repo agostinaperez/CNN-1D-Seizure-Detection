@@ -24,7 +24,7 @@ from src.config import (
     EVENT_MIN_ALARM_INTERVAL,
     WINDOW_RANGE_FOR_EVENT,
     POSITIVES_FOR_EVENT,
-    MIN_EVENT_SENSITIVITY,
+    MAX_FALSE_ALARMS_PER_HOUR,
     MODELS_DIR,
     NUM_WORKERS,
     SPLIT_FILE,
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--threshold", type=float, default=None, help="Umbral de decisión. Por defecto usa el que guardó el checkpoint.")
-    parser.add_argument("--min-event-sensitivity", type=float, default=None, help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor tasa de falsas alarmas por hora que la alcance.")
+    parser.add_argument("--max-false-alarms-per-hour", type=float, default=None, help="Techo clínico de falsas alarmas de evento por hora: entre los umbrales que lo respetan se elige el de mayor sensibilidad de crisis.")
     parser.add_argument("--positives-for-event", type=int, default=None, help="Alarma si hay >= N positivos dentro de las últimas N_WINDOW ventanas (nivel evento).")
     parser.add_argument("--window-range-for-event", type=int, default=None, help="Cantidad de ventanas consecutivas consideradas para la regla de evento (nivel evento).")
     parser.add_argument("--event-min-alarm-interval", type=float, default=None, help="Segundos mínimos entre dos alarmas (nivel evento).")
@@ -114,16 +114,16 @@ def main() -> None:
     model.to(device)
     model.eval()  # modo evaluar (chau dropout y eso)
 
-    # el event config guarda n_within y n_window (tiro alarma si en n_window ventanas hay n_within positivas), tamb guarda min alarm interval, max latency, y min event sensitivity
+    # el event config guarda n_within y n_window (tiro alarma si en n_window ventanas hay n_within positivas), tamb guarda min alarm interval, max latency, y el techo de falsas alarmas
     event_config = checkpoint.get("event_config", {})
     
-    min_event_sensitivity = ( args.min_event_sensitivity if args.min_event_sensitivity is not None else event_config.get("min_event_sensitivity", MIN_EVENT_SENSITIVITY))
+    max_false_alarms_per_hour = ( args.max_false_alarms_per_hour if args.max_false_alarms_per_hour is not None else event_config.get("max_false_alarms_per_hour", MAX_FALSE_ALARMS_PER_HOUR))
     positives_for_event = args.positives_for_event if args.positives_for_event is not None else event_config.get("n_within", POSITIVES_FOR_EVENT)
     window_range_for_event = args.window_range_for_event if args.window_range_for_event is not None else event_config.get("n_window", WINDOW_RANGE_FOR_EVENT)
     event_min_alarm_interval = args.event_min_alarm_interval if args.event_min_alarm_interval is not None else event_config.get("min_alarm_interval", EVENT_MIN_ALARM_INTERVAL)
     event_max_latency = args.event_max_latency if args.event_max_latency is not None else event_config.get("max_latency", EVENT_MAX_LATENCY)
-    if not 0.0 <= min_event_sensitivity <= 1.0:
-        raise ValueError("min_event_sensitivity debe estar entre 0 y 1")
+    if max_false_alarms_per_hour <= 0:
+        raise ValueError("max_false_alarms_per_hour debe ser mayor que cero")
     if positives_for_event <= 0 or window_range_for_event <= 0 or positives_for_event > window_range_for_event:
         raise ValueError("Configuración de ventanas de evento inválida")
     if event_min_alarm_interval < 0 or event_max_latency < 0:
@@ -226,15 +226,15 @@ def main() -> None:
             probs, labels,
             file_ids=dataset.file_ids, local_ids=dataset.local_ids,
             valid_files=dataset.valid_files, annotations=dataset.annotations,
-            min_sensibility=min_event_sensitivity,
+            max_false_alarms_per_hour=max_false_alarms_per_hour,
             n_within=positives_for_event, n_window=window_range_for_event,
             min_alarm_interval=event_min_alarm_interval,
             max_latency=event_max_latency,
         )
 
     if ev is None:
-        # ningún umbral alcanza el objetivo de sensibilidad de crisis -> mostramos el
-        # umbral con la máxima sensibilidad de crisis alcanzable, a título informativo.
+        # ningún umbral respeta el techo (mediana por paciente) -> mostramos el de menor
+        # mediana de falsas alarmas (el más cercano al techo), a título informativo.
         for _t in THRESHOLD_GRID:
             _e = event_metrics(probs, labels,
                                 file_ids=dataset.file_ids, local_ids=dataset.local_ids,
@@ -243,21 +243,21 @@ def main() -> None:
                                  n_within=positives_for_event, n_window=window_range_for_event,
                                  min_alarm_interval=event_min_alarm_interval,
                                  max_latency=event_max_latency)
-            if ev is None or _e["sensibility"] > ev["sensibility"]:
+            if ev is None or _e["median_false_alarms_per_hour"] < ev["median_false_alarms_per_hour"]:
                 ev = _e
                 ev_threshold = float(_t)
         print("\n  [NIVEL EVENTO (crisis)]")
-        print(f"  [WARN] Ningún umbral alcanzó sens de crisis >= {min_event_sensitivity}. "
-              f"Mostrando el de máxima sensibilidad (umbral {ev_threshold:.2f}).")
+        print(f"  [WARN] Ningún umbral respetó el techo de {max_false_alarms_per_hour:.0f} falsas alarmas/h. "
+              f"Mostrando el de menor mediana (umbral {ev_threshold:.2f}).")
     elif args.split == "test":
         print(f"  Threshold aplicado (fijado en validación): {ev_threshold:.2f}")
     else:
         print("\n  [NIVEL EVENTO (crisis)]")
-        print(f"  Punto de operación (sens de crisis >= {min_event_sensitivity}, menor tasa de falsas alarmas/h): "
-              f"umbral={ev_threshold:.2f}  falsas alarmas={ev['event_false_alarms_per_hour']:.2f}/h")
+        print(f"  Punto de operación (mediana de falsas alarmas <= {max_false_alarms_per_hour:.1f}/h, mayor sensibilidad): "
+              f"umbral={ev_threshold:.2f}  mediana={ev['median_false_alarms_per_hour']:.2f}/h")
 
     print(f"  Sensibilidad:              {ev['sensibility']:.4f}  ({ev['n_detected']}/{ev['n_seizures']} crisis detectadas)")
-    print(f"  Falsas alarmas de evento/h: {ev['event_false_alarms_per_hour']:.4f}  ({ev['n_false_alarms']} falsas alarmas en {ev['total_hours']:.1f} h cubiertas)")
+    print(f"  Falsas alarmas de evento/h: {ev['event_false_alarms_per_hour']:.4f}  (mediana por paciente: {ev['median_false_alarms_per_hour']:.4f})  ({ev['n_false_alarms']} falsas alarmas en {ev['total_hours']:.1f} h cubiertas)")
     print(f"  Latencia media:            {ev['latency_mean']:.2f} s")
     print(f"  Latencia mediana:          {ev['latency_median']:.2f} s")
     print(f"  Postprocesado:             >= {positives_for_event} positivos en {window_range_for_event} ventanas consecutivas")

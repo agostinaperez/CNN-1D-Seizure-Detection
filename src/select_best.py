@@ -2,14 +2,14 @@
 
 Lee el historial que guardó ``src.train`` (``<checkpoint>.history.json``) de
 cada escenario entrenado y compara su punto de operación en VALIDACIÓN
-(menor FDR entre los que alcanzan la sensibilidad de crisis objetivo). El
-test NO se usa acá: se evalúa una sola vez, después, sobre el ganador.
+(mayor sensibilidad de crisis entre los que respetan el techo de falsas alarmas
+por hora). El test NO se usa acá: se evalúa una sola vez, después, sobre el ganador.
 
 Uso:
     python -m src.select_best \
-        --checkpoints models/ratio3_pw1.pt models/ratio4_pw1.pt \
-                       models/ratio1_pw1.pt models/ratio3_pw15.pt \
-        --min-event-sensitivity 0.9 \
+        --checkpoints models/control.pt models/pw3.pt \
+                       models/lr_bajo.pt models/reg.pt \
+        --max-false-alarms-per-hour 10 \
         --out results/best_model.json
 """
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 
-from src.config import MIN_EVENT_SENSITIVITY
+from src.config import MAX_FALSE_ALARMS_PER_HOUR
 
 
 def _history_path(checkpoint: Path) -> Path:
@@ -87,6 +87,7 @@ def _load_row(checkpoint: Path) -> dict | None:
             }
 
     fdr = payload.get("best_event_false_alarms_per_hour", payload.get("best_fdr_per_hour"))
+    median_fdr = payload.get("best_median_false_alarms_per_hour", fdr)
     sensibility = payload.get("best_op_sensibility")
     return {
         "checkpoint": str(checkpoint),
@@ -96,6 +97,7 @@ def _load_row(checkpoint: Path) -> dict | None:
         "best_val_loss": payload.get("best_val_loss"),
         "fdr_per_hour": float(fdr) if fdr is not None else math.inf,
         "event_false_alarms_per_hour": float(fdr) if fdr is not None else math.inf,
+        "median_false_alarms_per_hour": float(median_fdr) if median_fdr is not None else math.inf,
         "event_sensitivity": float(sensibility) if sensibility is not None else 0.0,
         "op_threshold": payload.get("best_op_threshold"),
         "neg_pos_ratio": payload.get("neg_pos_ratio"),
@@ -108,7 +110,7 @@ def _load_row(checkpoint: Path) -> dict | None:
 
 def select_best(
     checkpoints: list[Path],
-    min_event_sensitivity: float = MIN_EVENT_SENSITIVITY,
+    max_false_alarms_per_hour: float = MAX_FALSE_ALARMS_PER_HOUR,
 ) -> dict:
     """Compara los escenarios por validación y devuelve el resumen + ganador."""
     rows = []
@@ -117,19 +119,26 @@ def select_best(
         row["eligible"] = bool(
             row.get("checkpoint_saved")
             and "error" not in row
-            and math.isfinite(row["fdr_per_hour"])
-            and row["event_sensitivity"] >= min_event_sensitivity
+            and math.isfinite(row["median_false_alarms_per_hour"])
+            and row["median_false_alarms_per_hour"] <= max_false_alarms_per_hour
         )
         rows.append(row)
+
+    # La arquitectura se compara sin dropout: el dropout es un hiperparámetro de
+    # escenario (varía entre configuraciones) y ya queda registrado en `scenario`.
+    architecture_keys = ("in_channels", "conv_channels", "conv_kernels", "fc_units")
+
+    def _architecture_signature(config: dict) -> dict:
+        model = config.get("model_config") or {}
+        return {key: model.get(key) for key in architecture_keys}
 
     compatibility_keys = (
         "protocol_version",
         "split_id",
         "scaler_id",
         "preprocessing",
-        "model_config",
         "event_config",
-        "min_event_sensitivity",
+        "max_false_alarms_per_hour",
         "threshold_grid",
         "seed",
     )
@@ -139,23 +148,28 @@ def select_best(
         if not config or "error" in row:
             continue
         signature = {key: config.get(key) for key in compatibility_keys}
+        signature["architecture"] = _architecture_signature(config)
         if reference is None:
             reference = signature
         elif signature != reference:
             row["eligible"] = False
             row["error"] = "protocolo incompatible con los demás escenarios"
-        if config.get("min_event_sensitivity") != float(min_event_sensitivity):
+        if config.get("max_false_alarms_per_hour") != float(max_false_alarms_per_hour):
             row["eligible"] = False
-            row["error"] = "sensibilidad objetivo distinta de la selección"
+            row["error"] = "techo de falsas alarmas distinto del de la selección"
 
     eligible = [r for r in rows if r.get("eligible")]
-    winner = min(eligible, key=lambda r: r["fdr_per_hour"]) if eligible else None
+    # Ganador: mayor sensibilidad de crisis; desempate: menor mediana de falsas alarmas.
+    if eligible:
+        winner = max(eligible, key=lambda r: (r["event_sensitivity"], -r["median_false_alarms_per_hour"]))
+    else:
+        winner = None
 
     return {
-        "min_event_sensitivity": min_event_sensitivity,
+        "max_false_alarms_per_hour": max_false_alarms_per_hour,
         "results": rows,
         "winner": winner["checkpoint"] if winner else None,
-        "selection_metric": "menor tasa de falsas alarmas de evento por hora en validacion entre los escenarios con sensibilidad de crisis >= objetivo",
+        "selection_metric": "mayor sensibilidad de crisis en validacion entre los escenarios con mediana de falsas alarmas de evento por hora <= techo",
     }
 
 
@@ -167,20 +181,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Elegir el mejor escenario por validación")
     parser.add_argument("--checkpoints", nargs="+", required=True,
                         help="Checkpoints .pt a comparar (sus .history.json deben existir).")
-    parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY)
+    parser.add_argument("--max-false-alarms-per-hour", type=float, default=MAX_FALSE_ALARMS_PER_HOUR)
     parser.add_argument("--out", type=str, default=None, help="Guardar resumen JSON opcional.")
     args = parser.parse_args()
-    if not 0.0 <= args.min_event_sensitivity <= 1.0:
-        parser.error("--min-event-sensitivity debe estar entre 0 y 1")
+    if args.max_false_alarms_per_hour <= 0:
+        parser.error("--max-false-alarms-per-hour debe ser mayor que cero")
 
     summary = select_best(
         [Path(c) for c in args.checkpoints],
-        args.min_event_sensitivity,
+        args.max_false_alarms_per_hour,
     )
 
-    print("checkpoint | ratio | pos_weight | noise_std | sens_val | falsas_alarmas_evento/h | umbral | elegible")
+    print("checkpoint | ratio | pos_weight | noise_std | sens_val | mediana_falsas_alarmas/h | umbral | elegible")
     print("-" * 96)
-    for row in sorted(summary["results"], key=lambda r: r["fdr_per_hour"]):
+    for row in sorted(summary["results"], key=lambda r: (-r["event_sensitivity"], r["median_false_alarms_per_hour"])):
         name = Path(row["checkpoint"]).name if "error" not in row else row["checkpoint"]
         if "error" in row:
             print(f"{name} | [ERROR] {row['error']}")
@@ -188,11 +202,11 @@ def main() -> None:
         print(
             f"{name} | {row['neg_pos_ratio']} | {row['pos_weight']} | "
             f"{row['noise_std']} | {row['event_sensitivity']:.3f} | "
-            f"{_fmt_fdr(row['event_false_alarms_per_hour'])} | {row['op_threshold']} | {row['eligible']}"
+            f"{_fmt_fdr(row['median_false_alarms_per_hour'])} | {row['op_threshold']} | {row['eligible']}"
         )
 
     if summary["winner"] is None:
-        print("\nNingún escenario alcanza el objetivo de sensibilidad en validación.")
+        print("\nNingún escenario respeta el techo de falsas alarmas en validación.")
     else:
         print(f"\nGanador (evaluar este en test una sola vez): {summary['winner']}")
 

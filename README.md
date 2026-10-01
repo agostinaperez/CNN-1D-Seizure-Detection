@@ -24,12 +24,12 @@ Para especificar formalmente al agente, se utiliza el framework **PEAS** (*Perfo
 #### 1.1.2. Tipo de programa de agente
 El agente corresponde a un **agente que aprende**, entrenado mediante aprendizaje supervisado, y su arquitectura interna se corresponde con:
 
-- **Elemento de actuación** (*performance element*): la CNN-1D entrenada (`SeizureCNN`), que mapea cada ventana de entrada a un logit de crisis.
-- **Crítica** (*critic*): la función de pérdida (BCE con `pos_weight`) durante el entrenamiento, y las métricas clínicas (sensibilidad, especificidad, FPR, FP/hora) en validación y test, que juzgan la calidad de la acción según un criterio externo fijo.
-- **Elemento de aprendizaje** (*learning element*): el optimizador **AdamW** con *backpropagation*, que modifica los pesos de la red para mejorar el desempeño futuro.
-- **Generador de problemas** (*problem generator*): el muestreo balanceado y aleatorizado del entrenamiento (submuestreo de la clase mayoritaria con `NEG_POS_RATIO`, *shuffle* de batches), que propone experiencias nuevas y variadas para explorar.
+- **Elemento de actuación**: la CNN-1D entrenada (`SeizureCNN`), que mapea cada ventana de entrada a un logit de crisis.
+- **Crítica**: la función de pérdida (BCE con `pos_weight`) durante el entrenamiento, y las métricas clínicas (sensibilidad, especificidad, FPR, FP/hora) en validación y test, que juzgan la calidad de la acción según un criterio externo fijo.
+- **Elemento de aprendizaje**: el optimizador AdamW con backpropagation, que modifica los pesos de la red para mejorar el desempeño futuro.
+- **Generador de problemas**: el muestreo balanceado y aleatorizado del entrenamiento (submuestreo de la clase mayoritaria con `NEG_POS_RATIO`, shuffle de batches), que propone experiencias nuevas y variadas para explorar.
 
-En la etapa de inferencia, el agente aprendido se comporta además como un **agente basado en utilidad**: la salida sigmoide es una *utilidad* continua (probabilidad de crisis) que representa el grado de satisfacción con la hipótesis "hay crisis", y el umbral de decisión (`THRESHOLD`) permite el *trade-off* entre sensibilidad y especificidad. Subir el umbral prioriza la especificidad (menos falsas alarmas); bajarlo prioriza la sensibilidad (menos crisis perdidas), permitiendo una decisión racional bajo incertidumbre.
+En la etapa de inferencia, el agente aprendido se comporta como un agente basado en utilidad: la salida sigmoide es una utilidad continua (probabilidad de crisis) que representa el grado de satisfacción con la hipótesis "hay crisis", y el umbral de decisión (`THRESHOLD`) permite el trade-off entre sensibilidad y especificidad. Subir el umbral prioriza la especificidad (menos falsas alarmas); bajarlo prioriza la sensibilidad (menos crisis perdidas), permitiendo una decisión racional bajo incertidumbre.
 
 ## 2. Origen y Naturaleza de los Datos
 Se utiliza un dataset clínico de dominio público perteneciente al Hospital Infantil de Boston (CHB) en colaboración con el MIT, conformando el CHB-MIT Scalp EEG Database(https://physionet.org/content/chbmit/1.0.0/).
@@ -114,202 +114,69 @@ python -m src.evaluate --checkpoint models/best.pt --split test --data-dir <ruta
 python -m src.inference --input <archivo.edf> --checkpoint models/best.pt
 ```
 
-## 7. Validación cruzada y experimentos
+## 7. Experimentos y selección del modelo
 
 Para comparar hiperparámetros sin mezclar pacientes entre entrenamiento y
-validación se usa validación cruzada agrupada por paciente.
+validación se usa un **split inter-paciente fijo** (train/val/test), sin
+validación cruzada (esto sería una mejora futura, lo ideal para la implementación de mi trabajo final de grado).
 
-El `split.json` actual mantiene el test fijo. Los pacientes de `train` y `val`
-forman el conjunto de desarrollo y se dividen en cuatro folds. Cada fold tiene
-12 pacientes para entrenamiento y 4 para validación. Nunca se mezclan ventanas
-del mismo paciente entre ambos conjuntos.
+### 7.1 Split inter-paciente
 
-El test no se usa para elegir hiperparámetros. Solo se evalúa una vez, cuando ya
-se eligió la configuración final.
-
-### 7.1 Generar los folds
-
-```bash
-python -m src.cross_validation \
-    --split-file data/processed/split.json \
-    --out data/processed/cv_splits.json \
-    --n-folds 4 \
-    --seed 42
-```
-
-Esto genera:
+`python -m src.split` genera `data/processed/split.json` con:
 
 ```text
-data/processed/cv_splits.json
-data/processed/cv_splits_fold_1.json
-data/processed/cv_splits_fold_2.json
-data/processed/cv_splits_fold_3.json
-data/processed/cv_splits_fold_4.json
-data/processed/cv_splits_final.json
+train = 13 pacientes
+val   = 5 pacientes
+test  = 6 pacientes
 ```
 
-### 7.2 Calcular el scaler de cada fold
+La asignación es determinista para el mismo dataset y los mismos parámetros del
+algoritmo y equilibra archivos y segundos de crisis. El val se
+reserva de train y nunca se mezcla con él; el test queda congelado después de
+generar el split.
 
-Cada fold necesita sus propias estadísticas de RobustScaler. Las estadísticas se
-calculan únicamente con los pacientes de train de ese fold.
+El val incluye un paciente obligatorio de crisis cortas (`VAL_REQUIRED_PATIENTS`
+= chb14) para que la selección del umbral "vea" el caso difícil. chb16 (crisis
+de ~8 s) se mantiene en test.
+
+### 7.2 Calcular el scaler (una sola vez)
+
+Todos los escenarios comparten los mismos pacientes de train, así que el
+RobustScaler se calcula una única vez:
 
 ```bash
 python -m src.preprocessing --compute-stats \
     --data-dir <ruta/chbmit/1.0.0> \
-    --split-file data/processed/cv_splits_fold_1.json \
-    --stats-out data/processed/scaler_ratio3_pw1_fold_1.npz
+    --stats-out data/processed/scaler_stats.npz
 ```
 
-El nombre incluye el experimento para no mezclar scalers entre configuraciones.
-Se repite cambiando `fold_1` por `fold_2`, `fold_3` y `fold_4`.
+### 7.3 Entrenar cada escenario
 
-### 7.3 Entrenar un experimento en los cuatro folds
-
-Un experimento es una configuración fija de hiperparámetros. Por ejemplo,
-`ratio3_pw1` significa `NEG_POS_RATIO=3` y `pos_weight=1`. Cada experimento
-genera cuatro checkpoints, uno por fold. El ganador todavía no es uno de estos
-checkpoints: es la configuración que funcione mejor en promedio.
+Un escenario es una configuración fija de hiperparámetros. Se entrena una CNN
+por escenario sobre los pacientes de train, con early stopping y selección del
+punto de operación sobre val (regla de evento 2-de-3). Por ejemplo:
 
 ```bash
 python -m src.train \
     --data-dir <ruta/chbmit/1.0.0> \
-    --split-file data/processed/cv_splits_fold_1.json \
-    --scaler-stats data/processed/scaler_ratio3_pw1_fold_1.npz \
-    --out models/cv/ratio3_pw1/fold_1.pt \
-    --backup-dir <ruta/backup/ratio3_pw1/fold_1> \
-    --neg-pos-ratio 3 \
-    --pos-weight 1 \
+    --out models/control.pt \
+    --pos-weight 1 --lr 1e-4 --weight-decay 1e-2 --dropout 0.4 \
+    --noise-std 0.1 \
     --seed 42
 ```
 
-Para los siguientes folds se cambian las rutas y el nombre del checkpoint:
+La grilla de escenarios de referencia:
 
-```text
-models/cv/ratio3_pw1/fold_1.pt
-models/cv/ratio3_pw1/fold_2.pt
-models/cv/ratio3_pw1/fold_3.pt
-models/cv/ratio3_pw1/fold_4.pt
-```
+| escenario | pos_weight | lr    | weight_decay | dropout | hipótesis |
+|-----------|------------|-------|--------------|---------|-----------|
+| control   | 1.0        | 1e-4  | 1e-2         | 0.4     | reproducir baseline |
+| pw3       | 3.0        | 1e-4  | 1e-2         | 0.4     | ponderación balanceada de positivas (crisis cortas) |
+| lr_bajo   | 1.0        | 5e-5  | 1e-2         | 0.4     | estabilizar el entrenamiento |
+| reg       | 1.0        | 1e-4  | 5e-2         | 0.5     | más L2 + dropout contra sobreajuste |
 
-Se repite cambiando `fold_1` por `fold_2`, `fold_3` y `fold_4`. El mismo
-`pos_weight` y el mismo ratio deben mantenerse en los cuatro folds de un
-experimento. Para probar otra configuración se crea otra carpeta, por ejemplo
-`models/cv/ratio3_pw1.5/`.
-
-En Colab, `--backup-dir` debe apuntar a una carpeta de Drive. Conviene usar una
-carpeta diferente por experimento y fold para no sobrescribir checkpoints con el
-mismo nombre.
-
-### 7.4 Historiales de validación
-
-Durante cada época, `src.train` evalúa automáticamente el fold de validación y
-guarda las métricas en:
-
-```text
-models/cv/ratio3_pw1/fold_1.history.json
-models/cv/ratio3_pw1/fold_1.oof.npz
-models/cv/ratio3_pw1/fold_1.oof.json
-```
-
-Los archivos `.oof.*` son las predicciones del fold sobre sus pacientes de
-validación y se usan después para fijar el threshold global. No se evalúa el test
-durante esta etapa. `src.evaluate --split val` es opcional
-si se quiere inspeccionar nuevamente un fold ya entrenado.
-
-### 7.5 Comparar los experimentos
-
-Después de terminar todos los folds de todos los experimentos se ejecuta:
-
-```bash
-python -m src.compare_cv \
-    --root models/cv \
-    --expected-folds 4 \
-    --min-event-sensitivity 0.9 \
-    --out results/cv_summary.json
-```
-
-El comparador agrupa los historiales por experimento y calcula:
-
-- FDR promedio y desvío entre folds.
-- Sensibilidad de evento promedio y desvío.
-- Cantidad de folds completados.
-- Elegibilidad según sensibilidad promedio `>= 0.90`.
-
-La configuración elegida es la de menor FDR promedio entre las configuraciones
-completas que alcanzan el objetivo de sensibilidad. Esta decisión se toma usando
-validación, nunca usando test. El comparador también verifica que existan los
-cuatro folds, sus checkpoints y sus archivos OOF, además de una configuración
-consistente de ratio, `pos_weight`, seed y modo temporal. Un fold sin checkpoint
-u OOF deja incompleto el experimento.
-
-Por ejemplo, si imprime:
-
-```text
-Configuracion seleccionada por validacion: ratio3_pw1
-```
-
-significa que ganó la configuración `--neg-pos-ratio 3 --pos-weight 1`. No
-significa que haya que elegir `fold_1.pt` como modelo final.
-
-### 7.6 Fijar threshold y cantidad de épocas desde OOF
-
-La configuración ganadora todavía necesita dos decisiones para el entrenamiento
-final: el threshold y la cantidad de épocas. Se obtienen usando las predicciones
-out-of-fold de los cuatro folds:
-
-```bash
-python -m src.finalize_cv \
-    --experiment-dir models/cv/ratio3_pw1 \
-    --expected-folds 4 \
-    --min-event-sensitivity 0.9 \
-    --out results/ratio3_pw1_recommendation.json
-```
-
-El archivo de recomendación contiene el threshold global elegido sobre todos los
-pacientes OOF y la mediana de las mejores épocas de los folds.
-
-### 7.7 Entrenamiento final del MVP
-
-Una vez fijados configuración, threshold y épocas, se calcula un scaler con los
-16 pacientes de desarrollo y se entrena un checkpoint nuevo sin validación
-interna. La validación ya fue utilizada por la CV; el test continúa intacto.
-
-Por ejemplo, si ganó `ratio3_pw1`:
-
-```bash
-python -m src.preprocessing --compute-stats \
-    --data-dir <ruta/chbmit/1.0.0> \
-    --split-file data/processed/cv_splits_final.json \
-    --stats-out data/processed/scaler_final.npz
-
-python -m src.train_final \
-    --data-dir <ruta/chbmit/1.0.0> \
-    --split-file data/processed/cv_splits_final.json \
-    --scaler-stats data/processed/scaler_final.npz \
-    --recommendation results/ratio3_pw1_recommendation.json \
-    --out models/final.pt \
-    --backup-dir <ruta/backup/final> \
-    --seed 42
-```
-
-`models/final.pt` es un entrenamiento nuevo con los 16 pacientes de desarrollo.
-No es una copia de ningún fold.
-
-### 7.8 Evaluación final sobre test
-
-Este es el único momento en que se usa el test para reportar el resultado final:
-
-```bash
-python -m src.evaluate \
-    --checkpoint models/final.pt \
-    --split test \
-    --data-dir <ruta/chbmit/1.0.0> \
-    --split-file data/processed/cv_splits_final.json
-```
-
-Después de esta evaluación no se deben cambiar hiperparámetros usando ese
-resultado. Si se cambia algo, hay que repetir la selección sobre validación y
-reservar el test nuevamente para el final.
+`--noise-std` controla el ruido gaussiano que se suma a las ventanas de crisis
+(clase minoritaria) durante el train; `--noise-std 0` lo desactiva. `--dropout`
+regula el dropout de la arquitectura.
 
 ### 7.6 Inferencia sobre un EDF
 

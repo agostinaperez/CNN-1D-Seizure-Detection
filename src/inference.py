@@ -1,23 +1,15 @@
 """
-CLI de inferencia: clasifica las ventanas de un EDF con un modelo ya entrenado.
+CLI de inferencia
 
     python -m src.inference --input ej.edf --checkpoint models/best.pt
 
-Flujo (tal cual la Fase 7 del PLAN_MVP):
-  1. Carga el checkpoint (pesos + config + stats del escalador + threshold).
-  2. Procesa el EDF: 16 canales TUEV -> filtro 0.5-50 Hz -> ventaneo 5.12 s / 50%
-     -> escalado robusto con las stats GUARDADAS en el checkpoint (las de train,
-     para escalar EXACTAMENTE igual que en el entrenamiento).
+  1. Carga el checkpoint
+  2. Procesa el EDF: 16 canales-> filtro -> ventaneo-> escalado con las stats del checkpoint
   3. Clasifica cada ventana (forward, sin gradientes) -> probabilidad de crisis.
   4. Aplica el threshold -> etiqueta binaria por ventana.
-   5. Imprime una tabla (ventana, inicio, tiempo de decisión, probabilidad,
-      predicción)
-      + un resumen de alarmas tras el postprocesado temporal.
+  5. Imprime una tabla (ventana, inicio, tiempo de decisión, probabilidad, predicción) + un resumen de alarmas tras el postprocesado temporal.
 
-A diferencia de evaluate.py, acá NO hay etiquetas reales: es para datos NUEVOS
-(predicción pura). El EDF se procesa offline completo. Por eso process_edf recibe
-seizures=[] (no se usa para etiquetar, solo para obtener las ventanas y sus tiempos
-de inicio).
+A diferencia de evaluate.py, acá no tengo etiquetas reales onda no comparo
 """
 
 from __future__ import annotations
@@ -38,8 +30,6 @@ from src.config import (
     THRESHOLD,
     WIN_SECONDS_EFFECTIVE,
 )
-# Reuso lo que ya escribí en evaluate.py: cargar el checkpoint y reconstruir la CNN
-# idéntica. (Evito duplicar esa lógica en dos archivos.)
 from src.evaluate import load_checkpoint, rebuild_model
 from src.preprocessing import process_edf
 from src.train import get_device
@@ -49,11 +39,8 @@ from src.protocol import preprocessing_config
 
 def classify_windows(model, windows: np.ndarray, device: str, batch_size: int) -> np.ndarray:
     """
-    Pasa TODAS las ventanas por la red (en batches para no reventar la memoria)
-    y devuelve la PROBABILIDAD de crisis de cada una, como array numpy (n,).
-
-    - model: la CNN en modo eval.
-    - windows: array (n_windows, 16, 1310) ya filtrado y escalado.
+    Pasa TODAS las ventanas por la red (en batches) y devuelve la PROBABILIDAD de crisis de cada una, como array numpy (n,).
+    - windows: array (n_windows, 16, 1310) filtrado y escalado
     """
     if batch_size <= 0:
         raise ValueError("batch_size debe ser mayor que cero")
@@ -63,14 +50,13 @@ def classify_windows(model, windows: np.ndarray, device: str, batch_size: int) -
     model.eval()
     probs: list[torch.Tensor] = []
 
-    # torch.no_grad(): no construyo grafo de gradientes, total no voy a entrenar.
-    # Ahorra memoria y es más rápido (igual que evaluate() en train.py).
+    # torch.no_grad(): no construyo grafo de gradientes, total no voy a entrenar
     with torch.no_grad():
         for i in range(0, len(windows), batch_size):
             chunk = windows[i:i + batch_size]               # (batch, 16, 1310)
-            x = torch.from_numpy(chunk).float().to(device)  # numpy -> tensor en CPU/GPU
+            x = torch.from_numpy(chunk).float().to(device)
             logits = model(x)                               # (batch, 1) logit crudo
-            # sigmoide sobre el logit -> probabilidad en (0, 1); .cpu() para seguir en numpy.
+            # sigmoide sobre el logit, squeeze(-1) para que quede (batch,) y cpu() para pasar a numpy
             probs.append(torch.sigmoid(logits.squeeze(-1)).cpu())
 
     return torch.cat(probs).numpy()  # (n_windows,)
@@ -80,7 +66,7 @@ def detect_alarms(preds: np.ndarray, starts: np.ndarray, *,
                   n_within: int = POSITIVES_FOR_EVENT, n_window: int = WINDOW_RANGE_FOR_EVENT,
                   min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL) -> list[float]:
     """
-    Postprocesado a nivel EVENTO (el MISMO que usa event_metrics en la evaluación):
+    Postprocesado a nivel evento (el MISMO que usa event_metrics en la evaluación):
     dispara una alarma cuando hay >= `n_within` predicciones positivas dentro de las
     últimas `n_window` ventanas consecutivas, y suprime alarmas separadas por menos
     de `min_alarm_interval` segundos.

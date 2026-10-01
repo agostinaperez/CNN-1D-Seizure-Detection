@@ -92,12 +92,12 @@ def diagrama_pipeline() -> Path:
 
     steps_r = [
         ("split.json\n70/30 inter-paciente proporcional", ""),
-        ("Cross-validation agrupada\npor paciente (4 folds) — OOF", ""),
+        ("Train 13 / val 3 / test 8\n(split fijo, sin folds)", ""),
         ("Undersampling (ratio NEG_POS)\n+ toutes las positivas", ""),
+        ("Ruido gaussiano en\nventanas de crisis (augmentation)", ""),
         ("BCEWithLogitsLoss + pos_weight\nADAMW + coseno + grad clip", ""),
-        ("Selección de checkpoint\nargmin FDR s.a. sens_evento ≥ 0.9", ""),
-        ("finalize_cv (OOF): umbral τ\ny nº de épocas globales", ""),
-        ("Entrenamiento final\n(todo el conjunto de desarrollo)", ""),
+        ("Selección de checkpoint\nmáx sens_evento s.a. falsas alarmas/h ≤ techo (val)", ""),
+        ("Selección del mejor escenario\npor validación (select_best)", ""),
         ("Evaluación final sobre TEST\n(una sola vez)", ""),
     ]
     for i, (txt, _) in enumerate(steps_r):
@@ -294,12 +294,13 @@ def build() -> Path:
             "un escalador robusto cuyas estadísticas se estiman exclusivamente sobre el conjunto de "
             "entrenamiento (para evitar fuga de datos).")
     _p(doc, "El segundo plano es la metodología de validación: un split inter-paciente 70/30 con "
-            "repaso proporcional, una validación cruzada agrupada por paciente con predicciones "
-            "out-of-fold que permiten fijar el umbral global y el número de épocas, y un conjunto "
-            "de test que permanece intacto hasta la evaluación final. La selección del mejor "
-            "modelo no se hace por pérdida bruta ni por métricas de ventana, sino por el criterio "
-            "clínico de minimizar la tasa de falsas detecciones por hora (FDR) sujeto a detectar "
-            "al menos el 90% de las crisis.")
+            "repaso proporcional en conjuntos fijos de entrenamiento (13 pacientes), validación "
+            "(3 pacientes) y test (8 pacientes), sin validación cruzada para acotar el costo "
+            "computacional. Cada escenario de hiperparámetros se entrena una única vez, se "
+            "selecciona el mejor usando la validación y el test permanece intacto hasta la "
+            "evaluación final. La selección del mejor modelo no se hace por pérdida bruta ni por "
+            "métricas de ventana, sino por el criterio clínico de minimizar la tasa de falsas "
+             "alarmas de evento por hora sujeto a detectar al menos el 90% de las crisis.")
     _p(doc, "El tercer plano es la operación: se describe una estrategia reproducible de cómputo "
             "en Google Cloud (GCP) con checkpoints respaldados de forma incremental, versionado de "
             "experimentos y recuperación ante interrupciones, de modo que ninguna corrida de "
@@ -339,7 +340,7 @@ def build() -> Path:
             "El estándar clínico moderno es el segundo. Wang et al. (IEEE TNSRE, 2025), en su "
             "artículo de referencia que emplea una CNN-1D sobre EEG de epilepsia frontal y "
             "temporal, reportan como métricas primarias la sensibilidad a nivel de evento, la "
-            "tasa de falsas detecciones por hora (FDR) y la latencia, y como métricas secundarias "
+             "tasa de falsas alarmas por hora y la latencia, y como métricas secundarias "
             "las de segmento (sensibilidad, especificidad, accuracy y AUC).")
     _p(doc, "Para la elección del punto de operación, la teoría de análisis ROC de Fawcett "
             "(2006) establece que la curva ROC describe el trade-off entre sensibilidad y "
@@ -348,7 +349,7 @@ def build() -> Path:
             "crisis (falso negativo) es mucho más grave que tolerar una alarma falsa esporádica. "
             "Por ello, la propuesta del presente trabajo fija un requisito clínico explícito "
             "(detectar ≥ 90% de las crisis) y, dentro de los umbrales que lo cumplen, minimiza el "
-            "FDR por hora, en línea con la exigencia de la propuesta de tesis de reportar la tasa "
+             "la tasa de falsas alarmas por hora, en línea con la exigencia de la propuesta de tesis de reportar la tasa "
             "de falsas alarmas por unidad de tiempo.")
     _p(doc, "Otros trabajos recientes del marco teórico (Wang et al., Sci. Rep. 2023; Saha et "
             "al., Heliyon 2025; Kashefi et al., Sci. Rep. 2025) operan sobre detección a nivel de "
@@ -498,29 +499,23 @@ def build() -> Path:
             "positivas quedan en test y, por lo tanto, la fiabilidad de la sensibilidad medida. "
             "Con peso 1.0 el test quedaba con solo ~13% de las crisis; con 2.0 se logra ~31% de "
             "archivos y ~19% de crisis, minimizando el peor desvío frente al 30% objetivo.")
-    _p(doc, "Dentro del conjunto de train se reservan 4 pacientes para validación, elegidos en "
+    _p(doc, "Dentro del conjunto de train se reservan 3 pacientes para validación, elegidos en "
             "posiciones centrales de la distribución de severidad para que sean representativos.")
-    doc.add_heading("5.2 Cross-validation agrupada por paciente", level=2)
-    _p(doc, "La elección de hiperparámetros no debe depender de una única partición de "
-            "validación y, sobre todo, no debe usar test. Se implementa una validación cruzada "
-            "agrupada por paciente (grouped K-fold): el conjunto de desarrollo (16 pacientes, "
-            "train + val del split base) se particiona en K=4 folds disjuntos de pacientes; en el "
-            "fold k se entrena con los otros 3 y se valida contra F_k. El test original (8 "
-            "pacientes) permanece fijo e intacto en todos los folds. Esto estima mejor la "
-            "distribución del desempeño frente a pacientes nuevos y reduce la variabilidad de "
-            "elegir un único grupo de validación.")
-    _p(doc, "Cada fold calcula su propio escalador robusto usando únicamente el train de ese "
-            "fold. No reutilizar el escalador global dentro de un fold es otra aplicación de la "
-            "regla anti-leakage.")
-    doc.add_heading("5.3 Predicciones out-of-fold y decisiones finales", level=2)
-    _p(doc, "En la mejor época de cada fold se guardan, además del checkpoint, las predicciones "
-            "de la validación de ese fold (archivos .oof.npz y .oof.json). Estas predicciones "
-            "provienen de pacientes que no participaron en el entrenamiento de su fold, por lo que "
-            "pueden unirse en una «validación cruzada virtual» sobre todo el conjunto de "
-            "desarrollo. Sobre esa masa de predicciones OOF se toman las únicas dos decisiones "
-            "globales que necesita el entrenamiento final: el umbral de decisión τ y el número "
-            "de épocas (la mediana de las mejores épocas de los folds).")
-    doc.add_heading("5.4 El test como examen final", level=2)
+    doc.add_heading("5.2 Selección de hiperparámetros por validación fija", level=2)
+    _p(doc, "La elección de hiperparámetros no debe usar el test. Dado el costo computacional de "
+            "entrenar una CNN por escenario, se opta por un split fijo en lugar de una validación "
+            "cruzada: el conjunto de desarrollo (16 pacientes, train + val) se reparte de una "
+            "única vez en 13 de entrenamiento y 3 de validación, y el test original (8 pacientes) "
+            "permanece intacto. Cada escenario de hiperparámetros se entrena una sola vez sobre "
+            "los 13 pacientes de train y se compara por sus métricas de validación. Esta es la "
+            "concesión metodológica del MVP: se sacrifica la estimación de la variabilidad entre "
+            "particiones (que aportaría una validación cruzada agrupada por paciente) a cambio de "
+            "reducir de forma drástica el número de entrenamientos, viable con los recursos "
+            "disponibles.")
+    _p(doc, "El escalador robusto se calcula una única vez sobre los 13 pacientes de train y se "
+            "comparte entre todos los escenarios, respetando la regla anti-leakage: validación y "
+            "test reutilizan exactamente esas estadísticas.")
+    doc.add_heading("5.3 El test como examen final", level=2)
     _p(doc, "El test evalúa el modelo final una única vez, después de fijar arquitectura, "
             "preprocesado, hiperparámetros, umbral y postprocesado. Si se modificara algo tras "
             "mirar el test, dejaría de ser una medición independiente. Este es el protocolo "
@@ -573,7 +568,7 @@ def build() -> Path:
             "es L = −[pos_weight·y·log(σ(z)) + (1−y)·log(1−σ(z))].")
     _p(doc, "La validación y el test NO se tocan: se evalúa la distribución natural completa, sin "
             "undersampling y sin pos_weight. Esta es la condición necesaria para que la "
-            "especificidad, el FPR y el FDR por hora sean honestos: solo midiendo sobre la "
+             "especificidad, el FPR y la tasa de falsas alarmas por hora sean honestos: solo midiendo sobre la "
             "distribución real de negativos se puede cuantificar cuántas falsas alarmas generaría "
             "el sistema por hora de registro.")
     doc.add_heading("7.2 Optimizador, programador y regularización", level=2)
@@ -595,11 +590,22 @@ def build() -> Path:
     doc.add_heading("7.3 Criterio de early stopping y guardado", level=2)
     _p(doc, "El early stopping y la selección del checkpoint no usan la pérdida bruta de "
             "validación (ver sección siguiente), sino el criterio clínico a nivel de evento: se "
-            "guarda el modelo cuando el punto de operación mejora (menor FDR) siempre que la "
-            "sensibilidad de crisis supere el objetivo. Los checkpoints (formato versionado)"
+             "guarda el modelo cuando el punto de operación mejora (mayor sensibilidad de crisis) "
+             "respetando un techo de falsas alarmas por hora. Los checkpoints (formato versionado)"
             " contienen pesos, configuración de arquitectura, estadísticas del escalador, umbral "
-            "operativo, configuración de evento e identidad del fold, todo serializado de forma "
-            "segura y auditable.")
+            "operativo, configuración de evento e hiperparámetros del escenario, todo serializado "
+            "de forma segura y auditable.")
+
+    doc.add_heading("7.4 Augmentación con ruido gaussiano", level=2)
+    _p(doc, "Siguiendo a Wang et al. (IEEE TNSRE, 2025), que agrega ruido gaussiano a las "
+            "muestras ictales para aliviar el desbalance de clases, se suma ruido aditivo "
+            "N(0, σ) exclusivamente a las ventanas de crisis durante el entrenamiento. El desvío "
+            "σ (NOISE_STD = 0.1) está expresado en unidades de la señal ya escalada por el "
+            "RobustScaler (mediana ~0, IQR ~1), es decir, relativo a la dispersión del canal y no "
+            "una amplitud absoluta en microvoltios. La augmentación diversifica la clase "
+            "minoritaria en cada época sin tocar la clase basal, y puede desactivarse con "
+            "NOISE_STD = 0. Se aplica con un generador aleatorio independiente del muestreo, de "
+            "modo que undersampling y shuffle permanecen reproducibles con la misma semilla.")
 
     # ---------- 8. Métricas y criterio de selección --------------------------
     doc.add_heading("8. Métricas y criterio de selección del modelo", level=1)
@@ -628,8 +634,9 @@ def build() -> Path:
             "definen tres magnitudes:")
     _bullet(doc, "Sensibilidad de evento = crisis detectadas / crisis totales. Una crisis está "
                  "detectada si existe una alarma dentro de [onset, onset + 30 s] (EVENT_MAX_LATENCY).")
-    _bullet(doc, "FDR (false detection rate) = falsas alarmas / horas de registro cubiertas. Es "
-                 "el “falsos positivos por hora” a nivel de evento, el estándar de la literatura "
+    _bullet(doc, "Tasa de falsas alarmas de evento por hora = falsas alarmas / horas de registro cubiertas. Es "
+                 "el “falsos positivos por hora” a nivel de evento; se distingue de FDR, que normalmente "
+                 "divide falsas alarmas por el total de alarmas. "
                  "y de los sistemas comerciales.")
     _bullet(doc, "Latencia = tiempo desde el onset de la crisis hasta la primera alarma "
                  "(media y mediana).")
@@ -667,12 +674,13 @@ def build() -> Path:
             "con sensibilidad de ventana “solo” 0.83 ya detectó 16 de 16 crisis (sensibilidad de "
             "evento 1.0) en la validación.")
     _p(doc, "El criterio adoptado se formaliza como un problema de optimización con restricción:")
-    _p(doc, "op = argmin_τ FDR(τ), sujeto a Sens_evento(τ) ≥ 0.9", align=WD_ALIGN_PARAGRAPH.CENTER)
-    _p(doc, "donde τ recorre una malla de umbrales (0.05…0.95). Esto fija un requisito clínico "
-            "explícito (no perder más del 10% de las crisis) y, dentro de los umbrales que lo "
-            "cumplen, minimiza las falsas alarmas por hora. El umbral elegido (op_threshold), la "
-            "sensibilidad y el FDR del punto de operación se guardan en el checkpoint. La pérdida "
-            "de validación se sigue registrando solo como referencia de diagnóstico.")
+    _p(doc, "op = argmax_τ Sens_evento(τ), sujeto a Falsas_alarmas_evento_por_hora(τ) ≤ techo", align=WD_ALIGN_PARAGRAPH.CENTER)
+    _p(doc, "donde τ recorre una malla de umbrales (0.05…0.95). El techo clínico de falsas alarmas "
+            "por hora (MAX_FALSE_ALARMS_PER_HOUR = 10) fija una tasa de alarma tolerable y, dentro de "
+            "los umbrales que lo respetan, se maximiza la sensibilidad de crisis. El umbral elegido "
+            "(op_threshold), la sensibilidad y la tasa de falsas alarmas por hora del punto de "
+            "operación se guardan en el checkpoint. La pérdida de validación se sigue registrando "
+            "solo como referencia de diagnóstico.")
     _p(doc, "Una aclaración metodológica importante: este criterio es una elección operativa de "
             "este trabajo. El análisis del marco teórico muestra que los papers de referencia "
             "evalúan ambos niveles simultáneamente (TNSRE 2025) o se mantienen a nivel de "
@@ -684,34 +692,24 @@ def build() -> Path:
 
     # ---------- 9. Protocolo de experimentación ------------------------------
     doc.add_heading("9. Protocolo completo de experimentación", level=1)
-    _p(doc, "El flujo operativo distingue tres unidades: el fold (un reparto concreto de "
-            "pacientes), el experimento (una configuración de hiperparámetros) y el modelo "
-            "final (un entrenamiento nuevo con la configuración ganadora).")
-    doc.add_heading("9.1 Entrenamiento por folds", level=2)
-    _p(doc, "Para cada experimento se entrenan los cuatro folds con la misma configuración "
-            "(ratio, pos_weight, seed), cada uno con su propio escalador. Cada corrida produce un "
-            "checkpoint .pt, un historial .history.json con las métricas por época y las "
-            "predicciones .oof.npz/.json. Los nombres incluyen los hiperparámetros para no pisar "
-            "resultados.")
-    doc.add_heading("9.2 Comparación de configuraciones (compare_cv)", level=2)
-    _p(doc, "El comparador agrupa los historiales por experimento y valida integridad: presencia "
-            "de los 4 folds, identificación 1 … 4, existencia de checkpoints y OOF, y "
-            "consistencia de hiperparámetros entre folds. Un experimento es elegible si tiene los "
-            "4 folds, FDR finito en todos ellos y sensibilidad de evento promedio ≥ 0.9. "
-            "Entre los elegibles se elige la configuración de menor FDR promedio. Nunca se usa "
-            "test en esta etapa. En empate, se prioriza menor desvío, luego menor latencia.")
-    doc.add_heading("9.3 Fijación de umbral y épocas (finalize_cv)", level=2)
-    _p(doc, "Sobre las predicciones OOF de los cuatro folds juntos se aplica el mismo criterio "
-            "clínico (argmin FDR con sens de evento ≥ 0.9) para obtener el umbral global τ. El "
-            "número de épocas del entrenamiento final es la mediana de las mejores épocas de los "
-            "folds. Si ninguna configuración alcanza la sensibilidad objetivo, se reporta el "
-            "mejor compromiso y no se fuerza el número sobre el test.")
-    doc.add_heading("9.4 Entrenamiento final y evaluación de test", level=2)
-    _p(doc, "Con la configuración ganadora se recalculan las estadísticas del escalador con los "
-            "16 pacientes de desarrollo del split final (cv_splits_final.json), se entrena un "
-            "modelo nuevo sin validación interna usando el umbral y las épocas fijados por OOF, y "
-            "recién entonces se evalúa sobre el test una sola vez. El resultado de ese comando es "
-            "el resultado final del MVP.")
+    _p(doc, "El flujo operativo distingue dos unidades: el escenario (una configuración de "
+            "hiperparámetros) y el modelo ganador (el checkpoint del escenario elegido por "
+            "validación). Cada escenario se entrena una única vez.")
+    doc.add_heading("9.1 Entrenamiento de los escenarios", level=2)
+    _p(doc, "Cada escenario se entrena una única vez con la misma configuración (ratio, "
+            "pos_weight, seed) y el mismo escalador (calculado sobre los 13 pacientes de train). "
+            "Cada corrida produce un checkpoint .pt y un historial .history.json con las métricas "
+            "por época. Los nombres incluyen los hiperparámetros (por ejemplo "
+            "models/ratio3_pw1.pt) para no pisar resultados.")
+    doc.add_heading("9.2 Selección del mejor escenario (select_best)", level=2)
+    _p(doc, "Al terminar los escenarios, select_best lee los historiales y compara el punto de "
+            "operación de cada uno en validación. Un escenario es elegible si guardó checkpoint y "
+            "su tasa de falsas alarmas de evento por hora respeta el techo clínico. Entre los "
+             "elegibles se elige el de mayor sensibilidad de crisis en validación. Nunca se usa test en esta etapa.")
+    doc.add_heading("9.3 Evaluación final sobre test", level=2)
+    _p(doc, "El checkpoint ganador se evalúa sobre el test una sola vez. El resultado de ese "
+            "comando es el resultado final del MVP. Si después se cambia un hiperparámetro, hay "
+            "que repetir la selección por validación y volver a reservar el test.")
 
     # ---------- 10. Estrategia operativa en GCP ------------------------------
     doc.add_heading("10. Estrategia operativa de cómputo en GCP (con checkpoints)", level=1)
@@ -727,9 +725,9 @@ def build() -> Path:
     _bullet(doc, "Datos: los EDF crudos se guardan en un bucket. Solo los pacientes de train + "
                  "val se copian al disco local para entrenar (lectura rápida); los de test se "
                  "traen únicamente para la evaluación final. Los artefactos livianos "
-                 "(split.json, cv_splits_*.json, scaler_*.npz) se suben una vez y se leen desde "
+                 "(split.json, scaler_stats.npz) se suben una vez y se leen desde "
                  "GCS/Drive.")
-    _bullet(doc, "Artefactos de entrenamiento: checkpoints, historiales y predicciones OOF se "
+    _bullet(doc, "Artefactos de entrenamiento: checkpoints e historiales se "
                  "escriben localmente y se respaldan de forma incremental (ver 10.2).")
     doc.add_heading("10.2 Backups incrementales de checkpoints", level=2)
     _p(doc, "El entrenamiento incorpora el parámetro --backup-dir: un directorio espejo, "
@@ -743,22 +741,22 @@ def build() -> Path:
     _bullet(doc, "Tolerancia a fallos del respaldo: si la escritura al bucket falla (montaje "
                  "desmontado, cuota agotada), el entrenamiento continúa y el fallo solo se "
                  "registra como advertencia; nunca una falla de backup mata una corrida.")
-    _p(doc, "La convención de nombres por experimento y fold (models/cv/<config>/fold_N.pt) "
+    _p(doc, "La convención de nombres por escenario (models/<config>.pt) "
             "garantiza que los respaldos de diferentes configuraciones no se pisen, habilitando "
             "la comparación posterior y el versionado de artefactos.")
     doc.add_heading("10.3 Recuperación ante interrupciones y preempción", level=2)
     _p(doc, "Las instancias preemptibles y las sesiones de Colab pueden terminarse en cualquier "
             "momento. El protocolo de reanudación es: (1) re-clonar el código y re-montar los "
-            "buckets; (2) comprobar qué folds/experimentos ya tienen checkpoint y OOF en GCS; "
+            "buckets; (2) comprobar qué escenarios ya tienen checkpoint e historial en GCS; "
             "(3) reanudar solo lo pendiente con la misma semilla, ratio, pos_weight y rutas, de "
             "modo que los resultados sean comparables con los ya existentes. El historial por "
             "época permite verificar en qué estado quedó cada corrida.")
     doc.add_heading("10.4 Reproducibilidad y auditoría", level=2)
     _p(doc, "Cada corrida persiste en su historial y checkpoint la semilla, ratio, pos_weight, "
-            "learning rate, weight decay, batch size, identidad del fold, versión de formato y "
-            "punto de operación elegido. El comparador verifica la consistencia de estos campos "
-            "entre folds antes de declarar a un experimento elegible, y el versionado de objetos "
-            "en GCS permite recuperar cualquier estado anterior del entrenamiento.")
+            "learning rate, weight decay, batch size, desvío del ruido gaussiano (noise_std), "
+            "versión de formato y punto de operación elegido. El selector verifica que el "
+            "escenario haya guardado checkpoint antes de declararlo elegible, y el versionado de "
+            "objetos en GCS permite recuperar cualquier estado anterior del entrenamiento.")
     doc.add_heading("10.5 Consideraciones de costo e I/O", level=2)
     _p(doc, "El pipeline es data-bound: el preprocesado (~1 s por archivo de hora) domina el "
             "tiempo de época frente al cómputo de la CNN. Por eso la estrategia prioriza "
@@ -770,13 +768,13 @@ def build() -> Path:
 
     # ---------- 11. Criterios de éxito y resultados --------------------------
     doc.add_heading("11. Criterios de éxito", level=1)
-    _p(doc, "El sistema se considera exitoso si, sobre la validación cruzada y luego sobre el "
-            "test inter-paciente, cumple: (a) sensibilidad de evento ≥ 0.90, es decir, detecta al "
-            "menos el 90% de las crisis; (b) un FDR lo más bajo posible entre los modelos que "
-            "cumplen (a), conforme a lo fijado por el criterio de selección; (c) una latencia de "
-            "detección acotada (media y mediana reportadas). Las métricas de ventana "
-            "(sensibilidad, especificidad, FPR, F1, MCC) se reportan como contexto, no como "
-            "criterio de selección.")
+    _p(doc, "El sistema se considera exitoso si, sobre la validación y luego sobre el "
+            "test inter-paciente, cumple: (a) una tasa de falsas alarmas de evento por hora que "
+            "respeta el techo clínico (≤ 10/h), de modo que el sistema sea tolerable para el clínico; "
+            "(b) la mayor sensibilidad de evento posible entre los modelos que cumplen (a), conforme "
+            "al criterio de selección; (c) una latencia de detección acotada (media y mediana "
+            "reportadas). Las métricas de ventana (sensibilidad, especificidad, FPR, F1, MCC) se "
+            "reportan como contexto, no como criterio de selección.")
 
     # ---------- 12. Limitaciones y trabajo futuro ----------------------------
     doc.add_heading("12. Limitaciones y trabajo futuro", level=1)
@@ -785,7 +783,8 @@ def build() -> Path:
                  "medir la latencia que eso reintroduce.")
     _bullet(doc, "La sensibilidad a nivel de evento depende del número de crisis por paciente; "
                  "con pocas crisis, un único falso negativo mueve mucho la métrica. Se debe "
-                 "reportar el número de crisis y detecciones por fold para valorar la robustez.")
+                 "reportar el número de crisis y detecciones por conjunto (validación y test) "
+                 "para valorar la robustez.")
     _bullet(doc, "El transfer learning sobre TUEV, la CNN-2D sobre espectrogramas y la "
                  "comparación de costo computacional quedan documentados como planes "
                  "independientes (PLAN_TRANSFER_LEARNING, PLAN_COMPUTO).")
@@ -795,13 +794,13 @@ def build() -> Path:
     # ---------- 13. Conclusiones ---------------------------------------------
     doc.add_heading("13. Conclusiones", level=1)
     _p(doc, "Este trabajo define un flujo completo, reproducible y defendible para la detección "
-            "de crisis epilépticas en EEG: preprocesamiento anti-fuga de datos, validación "
-            "cruzada agrupada por paciente, selección de modelo por criterio clínico a nivel de "
-            "evento, protocolo de experimentación con test reservado, y estrategia operativa en "
-            "la nube con checkpoints respaldados de forma incremental. La decisión central — "
-            "seleccionar el modelo minimizando el FDR sujeto a una sensibilidad de evento ≥ 0.9 — "
-            "traduce el requisito clínico a criterio objetivo de optimización y diferencia a "
-            "este trabajo de los que evalúan solo a nivel de segmento.")
+            "de crisis epilépticas en EEG: preprocesamiento anti-fuga de datos, split "
+            "inter-paciente con validación fija, selección de modelo por criterio clínico a nivel "
+            "de evento, protocolo de experimentación con test reservado, y estrategia operativa "
+             "en la nube con checkpoints respaldados de forma incremental. La decisión central — "
+             "seleccionar el modelo maximizando la sensibilidad de evento sujeto a un techo de falsas alarmas por hora — "
+             "traduce el requisito clínico a criterio objetivo de optimización y diferencia a "
+             "este trabajo de los que evalúan solo a nivel de segmento.")
 
     # ---------- Referencias ---------------------------------------------------
     doc.add_heading("Referencias", level=1)
@@ -828,12 +827,12 @@ def build() -> Path:
     glosario = [
         ("Evento (crisis)", "Crisis completa anotada; unidad de evaluación clínica."),
         ("Segmento / ventana", "Unidad de clasificación (5.12 s de señal)."),
-        ("FDR", "Falsas detecciones (alarmas) por hora de registro."),
-        ("OOF", "Predicciones out-of-fold: predicciones sobre pacientes no usados en el entrenamiento de ese fold."),
+        ("Falsas alarmas de evento por hora", "Falsas alarmas divididas por las horas de registro cubiertas."),
+        ("Ruido gaussiano (augmentation)", "Ruido aditivo N(0, σ) sobre las ventanas de crisis durante el train para diversificar la clase minoritaria."),
         ("Leakage", "Fuga de información de test hacia el entrenamiento que invalida las métricas."),
         ("pos_weight", "Peso de la clase positiva en la BCE ponderada."),
         ("Undersampling", "Submuestreo de la clase mayoritaria para balancear cada época."),
-        ("Punto de operación", "Umbral τ más sus métricas resultantes (sensibilidad, FDR)."),
+        ("Punto de operación", "Umbral τ más sus métricas resultantes (sensibilidad, falsas alarmas por hora)."),
         ("Latencia", "Tiempo desde el onset de la crisis hasta la primera alarma."),
     ]
     _table(doc, ["Término", "Definición"], glosario, widths=[5.0, 11.0])

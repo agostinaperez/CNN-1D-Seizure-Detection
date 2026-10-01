@@ -82,7 +82,7 @@ def compatibility_config(
     *,
     model_config: dict[str, Any],
     event_config: dict[str, Any],
-    min_event_sensitivity: float,
+    max_false_alarms_per_hour: float,
     threshold_grid: list[float],
     seed: int,
 ) -> dict[str, Any]:
@@ -94,7 +94,7 @@ def compatibility_config(
         "preprocessing": preprocessing_config(),
         "model_config": model_config,
         "event_config": event_config,
-        "min_event_sensitivity": float(min_event_sensitivity),
+        "max_false_alarms_per_hour": float(max_false_alarms_per_hour),
         "threshold_grid": [float(t) for t in threshold_grid],
         "seed": int(seed),
     }

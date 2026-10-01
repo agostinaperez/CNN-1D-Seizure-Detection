@@ -122,9 +122,11 @@ NOISE_STD = 0.1
 #treshold, se considera q la red predijo crisis. Es ajustable para priorizar sensibilidad o especificidad
 THRESHOLD = 0.75
 
-# Sensibilidad objetivo a nivel EVENTO. Entre los umbrales cuya sensibilidad de
-# CRISIS >= este valor, se elige el de MENOR tasa de falsas alarmas por hora.
-MIN_EVENT_SENSITIVITY = 0.9
+# Criterio de selección del punto de operación a nivel EVENTO: techo clínico de
+# falsas alarmas por hora medido como MEDIANA por paciente (robusto a un paciente
+# ruidoso). Entre los umbrales con mediana <= MAX_FALSE_ALARMS_PER_HOUR se elige el
+# de MAYOR sensibilidad de crisis (desempate: menor mediana de falsas alarmas).
+MAX_FALSE_ALARMS_PER_HOUR = 10.0
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
 # dispara una alarma si hay >= POSITIVES_FOR_EVENT predicciones positivas dentro de las últimas WINDOW_RANGE_FOR_EVENT ventanas consecutivas.
@@ -132,7 +134,9 @@ MIN_EVENT_SENSITIVITY = 0.9
 POSITIVES_FOR_EVENT = 2
 WINDOW_RANGE_FOR_EVENT = 3
 # Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
-EVENT_MIN_ALARM_INTERVAL = 30.0
+# 4 min (240 s): más conservador que 30 s, alinea el punto de operación con el
+# estándar clínico de la literatura (Wang TNSRE 2025 usa 20 min).
+EVENT_MIN_ALARM_INTERVAL = 240.0
 # Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].
 EVENT_MAX_LATENCY = 30.0
 #--------------------------------------------------------------------------------------------------------------------

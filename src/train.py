@@ -46,7 +46,7 @@ from src.config import (
     GRAD_CLIP,
     LEARNING_RATE,
     LR_MIN,
-    MIN_EVENT_SENSITIVITY,
+    MAX_FALSE_ALARMS_PER_HOUR,
     MODELS_DIR,
     N_CHANNELS,
     NEG_POS_RATIO,
@@ -185,7 +185,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
                     neg_pos_ratio: float = NEG_POS_RATIO,
                     op_threshold: float = THRESHOLD, op_sensibility: float = 0.0,
                     op_fdr_per_hour: float = float("inf"),
-                    min_event_sensitivity: float = MIN_EVENT_SENSITIVITY,
+                    max_false_alarms_per_hour: float = MAX_FALSE_ALARMS_PER_HOUR,
                     noise_std: float = NOISE_STD,
                     dropout: float = DROPOUT,
                     experiment_config: dict | None = None) -> None:
@@ -203,8 +203,8 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
       - op_*: punto de operación elegido en val a nivel EVENTO (umbral, sensibilidad
         de crisis y tasa de falsas alarmas por hora).
 
-    Se guarda en disco el momento en que el criterio clínico (menor tasa de falsas alarmas/h con sens
-    de crisis >= objetivo) fue el mejor, no el loss crudo.
+    Se guarda en disco el momento en que el criterio clínico (mayor sensibilidad de
+    crisis con tasa de falsas alarmas/h <= techo) fue el mejor, no el loss crudo.
     """
     # Crea la carpeta destino, por ejemplo models/ratio3_pw1.pt.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +239,7 @@ def save_checkpoint(path: Path, model: nn.Module, scaler_stats: dict, *,
             "n_window": WINDOW_RANGE_FOR_EVENT,
             "min_alarm_interval": EVENT_MIN_ALARM_INTERVAL,
             "max_latency": EVENT_MAX_LATENCY,
-            "min_event_sensitivity": min_event_sensitivity,
+            "max_false_alarms_per_hour": max_false_alarms_per_hour,
         },
         "epoch": epoch,
         "best_val_loss": best_val_loss,
@@ -276,8 +276,8 @@ def parse_args() -> argparse.Namespace:
                         help="Dropout del modelo (arquitectura). Debe estar en [0, 1).")
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Peso de la clase positiva en el loss. Default: igual a NEG_POS_RATIO.")
-    parser.add_argument("--min-event-sensitivity", type=float, default=MIN_EVENT_SENSITIVITY,
-                        help="Sensibilidad objetivo a nivel EVENTO (crisis): elige el umbral con menor tasa de falsas alarmas/h que la alcance.")
+    parser.add_argument("--max-false-alarms-per-hour", type=float, default=MAX_FALSE_ALARMS_PER_HOUR,
+                        help="Techo clínico de falsas alarmas de evento por hora: entre los umbrales que lo respetan se elige el de mayor sensibilidad de crisis.")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
@@ -306,11 +306,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dropout debe estar en [0, 1)")
     if args.pos_weight is not None and args.pos_weight <= 0:
         parser.error("--pos-weight debe ser mayor que cero")
-    for name, value in (
-        ("--min-event-sensitivity", args.min_event_sensitivity),
-    ):
-        if not 0.0 <= value <= 1.0:
-            parser.error(f"{name} debe estar entre 0 y 1")
+    if args.max_false_alarms_per_hour <= 0:
+        parser.error("--max-false-alarms-per-hour debe ser mayor que cero")
+    if not math.isfinite(args.max_false_alarms_per_hour):
+        parser.error("--max-false-alarms-per-hour debe ser finito")
     if args.limit_files is not None and args.limit_files <= 0:
         parser.error("--limit-files debe ser mayor que cero")
     return args
@@ -411,7 +410,7 @@ def main() -> None:
         scaler_stats,
         model_config=model_config,
         event_config=event_config,
-        min_event_sensitivity=args.min_event_sensitivity,
+        max_false_alarms_per_hour=args.max_false_alarms_per_hour,
         threshold_grid=THRESHOLD_GRID,
         seed=args.seed,
     )
@@ -457,10 +456,10 @@ def main() -> None:
 
     # Loop de entrenamiento con early stopping si no mejora en X cantidad de épocas.
     # El criterio de "mejor" es CLÍNICO y a nivel EVENTO, no el loss crudo: entre los
-    # umbrales cuya sensibilidad de CRISIS >= MIN_EVENT_SENSITIVITY se elige el de
-    # MENOR tasa de falsas alarmas por hora.
+    # umbrales con tasa de falsas alarmas/h <= techo se elige el de MAYOR sensibilidad.
     best_val_loss = float("inf")   # solo de referencia (se sigue guardando en el log)
     best_fdr = float("inf")
+    best_median_fdr = float("inf")
     best_op_threshold = THRESHOLD  # umbral del mejor punto de operación
     best_op_sensibility = 0.0      # sensibilidad de crisis de ese punto
     best_epoch = 0
@@ -472,7 +471,7 @@ def main() -> None:
     history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
 
     print(f"\n=== Entrenamiento ({args.epochs} épocas máx.) ===")
-    print(f"Criterio de selección: menor tasa de falsas alarmas/h con sens de crisis >= {args.min_event_sensitivity}")
+    print(f"Criterio de selección: mayor sens de crisis con falsas alarmas <= {args.max_false_alarms_per_hour}/h")
     print(f"La tabla de abajo es a nivel VENTANA @ umbral {THRESHOLD} (solo referencia).")
     print(f"{'Ep':>3} | {'train_loss':>12} | {'val_loss':>12} | {'sens':>10} | {'spec':>10} | "
           f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
@@ -495,12 +494,12 @@ def main() -> None:
         )
 
         # --- PUNTO DE OPERACIÓN A NIVEL EVENTO (criterio clínico de selección) ---
-            # Entre los umbrales cuya sensibilidad de CRISIS >= objetivo, el de MENOR tasa de falsas alarmas/h.
+            # Entre los umbrales con falsas alarmas/h <= techo, el de MAYOR sensibilidad.
         op_ev, op_threshold = select_event_operating_point(
             probs, labels,
             file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
             valid_files=val_ds.valid_files, annotations=val_ds.annotations,
-            min_sensibility=args.min_event_sensitivity,
+            max_false_alarms_per_hour=args.max_false_alarms_per_hour,
             n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
             min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
         )
@@ -508,12 +507,13 @@ def main() -> None:
         if op_ev is not None:
             ev = op_ev
             op_fdr = op_ev["event_false_alarms_per_hour"]
+            op_median_fdr = op_ev["median_false_alarms_per_hour"]
             op_sensibility = op_ev["sensibility"]
             warn_msg = None
         else:
-            # ningún umbral alcanza el objetivo de sensibilidad de CRISIS -> fallback:
-            # mostramos el umbral con la MÁXIMA sensibilidad de crisis alcanzable, y
-            # marcamos la tasa=inf para que este modelo NO pueda ser seleccionado.
+            # ningún umbral respeta el techo de falsas alarmas (mediana por paciente) -> fallback:
+            # mostramos el umbral con la MENOR mediana de falsas alarmas (el más cercano al techo),
+            # y marcamos la sensibilidad=0 para que este punto NO pueda ser seleccionado.
             ev = None
             for _t in THRESHOLD_GRID:
                 _e = event_metrics(probs, labels,
@@ -523,13 +523,14 @@ def main() -> None:
                                    n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
                                    min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
                                    max_latency=EVENT_MAX_LATENCY)
-                if ev is None or _e["sensibility"] > ev["sensibility"]:
+                if ev is None or _e["median_false_alarms_per_hour"] < ev["median_false_alarms_per_hour"]:
                     ev = _e
                     op_threshold = float(_t)
             op_fdr = float("inf")
+            op_median_fdr = ev["median_false_alarms_per_hour"]
             op_sensibility = ev["sensibility"]
-            warn_msg = (f"ningún umbral alcanzó sens de crisis >= {args.min_event_sensitivity} "
-                        f"(máximo logrado: {op_sensibility:.3f} @ umbral {op_threshold:.2f})")
+            warn_msg = (f"ningún umbral respetó el techo de {args.max_false_alarms_per_hour:.0f} falsas alarmas/h "
+                        f"(mínima mediana lograda: {ev['median_false_alarms_per_hour']:.1f}/h @ umbral {op_threshold:.2f})")
 
         elapsed_time_for_epoch = time.time() - t_epoch
 
@@ -540,8 +541,8 @@ def main() -> None:
         print(f"      ventana @ {THRESHOLD:.2f} : sens={m['sensibility']:.3f}  spec={m['specificity']:.3f}  "
               f"fp/h={m['false_positive_per_hour']:.1f}  F1={m['f1']:.3f}  MCC={m['mcc']:.3f}")
         print(f"      evento  @ {op_threshold:.2f} : sens={op_sensibility:.3f} "
-              f"({ev['n_detected']}/{ev['n_seizures']} crisis)  falsas alarmas={ev['event_false_alarms_per_hour']:.1f}/h  "
-              f"latencia={ev['latency_mean']:.1f}s")
+              f"({ev['n_detected']}/{ev['n_seizures']} crisis)  falsas alarmas={ev['event_false_alarms_per_hour']:.1f}/h "
+              f"(mediana={ev['median_false_alarms_per_hour']:.1f}/h)  latencia={ev['latency_mean']:.1f}s")
         if warn_msg is not None:
             print(f"      [WARN] {warn_msg}")
         print()
@@ -562,15 +563,20 @@ def main() -> None:
             "op_fdr_per_hour": op_fdr,
             "event_sensibility": ev["sensibility"],
             "event_false_alarms_per_hour": ev["event_false_alarms_per_hour"],
+            "event_median_false_alarms_per_hour": ev["median_false_alarms_per_hour"],
             "event_fdr_per_hour": ev["event_false_alarms_per_hour"],
             "event_latency_mean": ev["latency_mean"],
             "time_s": elapsed_time_for_epoch,
         })
 
-        # si el punto de operación EVENTO mejoró (menor tasa de falsas alarmas/h con sens >= objetivo)
-        improved = op_ev is not None and op_fdr < best_fdr
+        # si el punto de operación EVENTO mejoró (mayor sens de crisis con mediana de falsas alarmas <= techo)
+        improved = op_ev is not None and (
+            op_sensibility > best_op_sensibility
+            or (op_sensibility == best_op_sensibility and op_median_fdr < best_median_fdr)
+        )
         if improved:
             best_fdr = op_fdr
+            best_median_fdr = op_median_fdr
             best_val_loss = val_loss
             best_op_threshold = op_threshold
             best_op_sensibility = op_sensibility
@@ -582,7 +588,7 @@ def main() -> None:
                 pos_weight=pos_weight, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
                 op_threshold=op_threshold, op_sensibility=op_sensibility,
                 op_fdr_per_hour=op_fdr,
-                min_event_sensitivity=args.min_event_sensitivity,
+                max_false_alarms_per_hour=args.max_false_alarms_per_hour,
                 noise_std=args.noise_std,
                 dropout=args.dropout,
                 experiment_config=experiment_config,
@@ -595,7 +601,7 @@ def main() -> None:
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping: no mejoró la tasa de falsas alarmas/h (sens de crisis >= {args.min_event_sensitivity}) "
+                print(f"Early stopping: no mejoró la sens de crisis (falsas alarmas <= {args.max_false_alarms_per_hour}/h) "
                       f"en {args.patience} épocas. Cortando.")
                 break
 
@@ -603,15 +609,16 @@ def main() -> None:
 
     total_time = time.time() - start
     print(f"\n=== Fin del entrenamiento ===")
-    print(f"Mejor época (por menor tasa de falsas alarmas/h con sens de crisis >= {args.min_event_sensitivity}): {best_epoch}")
+    print(f"Mejor época (por mayor sens de crisis con mediana de falsas alarmas <= {args.max_false_alarms_per_hour}/h): {best_epoch}")
     print(f"  val_loss de esa época: {best_val_loss:.6f}")
-    print(f"  punto de operación: umbral={best_op_threshold:.2f}  sens={best_op_sensibility:.3f}  falsas alarmas={best_fdr:.3f}/h")
+    print(f"  punto de operación: umbral={best_op_threshold:.2f}  sens={best_op_sensibility:.3f}  "
+          f"falsas alarmas={best_fdr:.3f}/h (mediana={best_median_fdr:.3f}/h)")
     print(f"Tiempo total: {total_time / 60:.1f} min")
     # No se imprime una ruta si esta corrida no creó un checkpoint.
     if checkpoint_saved:
         print(f"Checkpoint: {args.out}")
     else:
-        print("Checkpoint: no guardado (ningún punto de operación alcanzó el objetivo).")
+        print("Checkpoint: no guardado (ningún punto de operación respetó el techo de falsas alarmas).")
 
     # Guarda el historial por época (curvas loss/accuracy para la tesis). Se persiste
     # junto al checkpoint como <nombre>.history.json para que el notebook lo pueda leer sin re-entrenar.
@@ -624,9 +631,10 @@ def main() -> None:
         "best_val_loss": best_val_loss,
         "best_fdr_per_hour": best_fdr,
         "best_event_false_alarms_per_hour": best_fdr,
+        "best_median_false_alarms_per_hour": best_median_fdr,
         "best_op_threshold": best_op_threshold,
         "best_op_sensibility": best_op_sensibility,
-        "min_event_sensitivity": args.min_event_sensitivity,
+        "max_false_alarms_per_hour": args.max_false_alarms_per_hour,
         "threshold": THRESHOLD,
         "pos_weight": pos_weight,
         "neg_pos_ratio": args.neg_pos_ratio,

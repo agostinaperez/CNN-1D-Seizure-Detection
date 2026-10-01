@@ -263,9 +263,18 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         del patient_metrics["latencies"]
 
     event_false_alarms_per_hour = n_false_alarms / total_hours if total_hours > 0 else 0.0
+    per_patient_fdr = [
+        patient_metrics["false_alarms_per_hour"]
+        for patient_metrics in by_patient.values()
+        if patient_metrics["hours"] > 0
+    ]
+    median_false_alarms_per_hour = (
+        float(np.median(per_patient_fdr)) if per_patient_fdr else 0.0
+    )
     return {
         "sensibility": n_detected / n_seizures if n_seizures > 0 else 0.0,
         "event_false_alarms_per_hour": event_false_alarms_per_hour,
+        "median_false_alarms_per_hour": median_false_alarms_per_hour,
         # Alias de lectura para historiales generados por versiones anteriores.
         "false_detection_per_hour": event_false_alarms_per_hour,
         "latency_mean": float(np.mean(latencies)) if latencies else 0.0,
@@ -280,19 +289,19 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
 
 
 def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
-                                 min_sensibility: float, n_within: int = 3, n_window: int = 4,
-                                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
-                                  thresholds=None) -> tuple[dict | None, float | None]:
+                                 max_false_alarms_per_hour: float, n_within: int = 3, n_window: int = 4,
+                                 min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                                 thresholds=None) -> tuple[dict | None, float | None]:
     """
-    Punto de operación a nivel EVENTO: entre los umbrales cuya sensibilidad de CRISIS
-    >= `min_sensibility`, el de MENOR tasa de falsas alarmas por hora.
+    Punto de operación a nivel EVENTO: entre los umbrales cuya MEDIANA de falsas
+    alarmas por hora por paciente NO supera `max_false_alarms_per_hour`, se elige el
+    de MAYOR sensibilidad de crisis (desempate: menor mediana de falsas alarmas por hora).
 
-    Recorre la misma malla de umbrales que `threshold_sweep`, evalúa cada uno con
-    `event_metrics` y se queda con el mejor (menor tasa de falsas alarmas por hora) que cumpla el objetivo de
-    sensibilidad de crisis.
+    Se usa la mediana por paciente (no el agregado) para que un único paciente ruidoso
+    no domine la selección.
 
     Devuelve (event_metrics, threshold) del punto elegido, o (None, None) si ningún
-    umbral alcanza el objetivo de sensibilidad a nivel evento.
+    umbral respeta el techo de falsas alarmas.
     """
     probs = np.asarray(probs).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
@@ -306,8 +315,16 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
                            valid_files=valid_files, annotations=annotations, threshold=t,
                            n_within=n_within, n_window=n_window,
                            min_alarm_interval=min_alarm_interval, max_latency=max_latency)
-        if ev["sensibility"] >= min_sensibility:
-            if best is None or ev["event_false_alarms_per_hour"] < best["event_false_alarms_per_hour"]:
+        if ev["median_false_alarms_per_hour"] <= max_false_alarms_per_hour:
+            better = (
+                best is None
+                or ev["sensibility"] > best["sensibility"]
+                or (
+                    ev["sensibility"] == best["sensibility"]
+                    and ev["median_false_alarms_per_hour"] < best["median_false_alarms_per_hour"]
+                )
+            )
+            if better:
                 best = ev
                 best_threshold = float(t)
     return best, best_threshold

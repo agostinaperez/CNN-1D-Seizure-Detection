@@ -231,10 +231,8 @@ def segment_windows(data: np.ndarray, win_samples: int = WIN_SAMPLES, stride: in
     #ahora sí aplico mi stride y hago el guardado físico en la memoria RAM. 
     #adentro de view tengo tres comas, cada una da una instrucción a una dimensión de la matriz view. En la dimensión 0 y la 2 pongo :, o sea digo q me de todo y sin recortar!
     #en la 1 hago ::stride -> la regla es escribir inicio:fin:paso . Así q mantengo el inicio y el fin, pero aplico el solapamiento que yo definí
-    windows = np.ascontiguousarray(view[:, ::stride, :])  # (C, W, WS)
-    #ahora acomodo las dimensiones de la matriz, porque pytorch exige que el lote de muestras sea la 1er dimensión (la 0)
-    #guardo los decimales a 32 bits (estaban en 64) para q los datos pesen menos y se acelere el entrenamiento (no me hace falta tener 64 bits)
-    windows = np.transpose(windows, (1, 0, 2)).astype(np.float32)
+    # UNA sola copia contigua ya en float32: así nunca materializo la matriz de ventanas en float64 (ahorra ~2x RAM en archivos largos).
+    windows = np.ascontiguousarray(view[:, ::stride, :].transpose(1, 0, 2), dtype=np.float32)  # (W, C, WS)
     #creo el "anotador". Agarro la cantidad de ventanas q voy a tener (ej 10), lo hago array (0, 1, 2, 3,...) y multiplico x mi stride (655), entonces queda (0, 655, 1310,...) y sé donde arranca cada ventana
     starts = np.arange(n_windows, dtype=np.int64) * stride
     return windows, starts
@@ -439,14 +437,11 @@ def apply_scaler(windows: np.ndarray, stats: dict | None) -> np.ndarray:
     if windows.ndim != 3 or windows.shape[1] != expected_channels:
         raise ValueError("Las ventanas no tienen la cantidad esperada de canales")
     
-    w = windows.astype(np.float64) #copia mi arreglo y cambia el tipo de datos a 64 bits para q la resta y división sea precisa. Después lo vuelvo a 32 por los motivmos mencionados en otras funciones
-    
-    
-    median = median[:, None]  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
+    median = median[:, None].astype(np.float32)  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
     #así median queda de (16, 1) y se alínea (desde la derecha) con w que es (numero_de_ventanas, 16, 1310). Los 16 quedan alineaditos
-    iqr = iqr[:, None]        # IQR por canal (hago lo mismo q hice con median recién)
-    
-    denom = np.where(iqr == 0, 1.0, iqr)#evito dividir por 0 entonces si en algún canal x error quedó el iqr 0 (sería q tuvo valores ctes todo el tiempo), lo seteo en 1
+    iqr = iqr[:, None].astype(np.float32)        # IQR por canal (hago lo mismo q hice con median recién)
+
+    denom = np.where(iqr == 0, np.float32(1.0), iqr)#evito dividir por 0 entonces si en algún canal x error quedó el iqr 0 (sería q tuvo valores ctes todo el tiempo), lo seteo en 1
 
     # QUÉ PASA ACÁ (broadcasting), con un ejemplo pq me pongo gagá y me cuesta seguirlo. Los array de numpy son muy exóticos
     #
@@ -482,8 +477,11 @@ def apply_scaler(windows: np.ndarray, stats: dict | None) -> np.ndarray:
     #        ... y así con cada canal y cada ventana.
     #
     #   Después se divide cada valor por denom[canal] (el IQR de ESE canal), y listo: cada canal queda centrado y re-escalado por SU propia mediana e IQR, sin que un canal se mezcle con otro.
-    out = (w - median) / denom
-    return out.astype(np.float32)
+    # Todo se hace en float32 e in-place: así NO materializo copias float64 de las ventanas (ahorra ~2-4x RAM en archivos largos).
+    w = windows.astype(np.float32, copy=True)
+    w -= median
+    w /= denom
+    return w
 
 
 # Pipeline completo de un archivo
@@ -511,7 +509,8 @@ def process_edf(path, seizures: list[tuple[int, int]], *, fs: int = FS, win_samp
         if matriz_señales is None:
             return {"ok": False, "reason": reason}
 
-        filtered = filter_bandpass(matriz_señales, fs=fs)
+        filtered = filter_bandpass(matriz_señales, fs=fs).astype(np.float32)
+        del matriz_señales  # libera la señal float64 lo antes posible
         windows, starts = segment_windows(filtered, win_samples=win_samples, stride=stride)
         n_win = windows.shape[0]
         labels = label_windows(
