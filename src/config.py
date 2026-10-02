@@ -74,8 +74,10 @@ SEED = 42
 # de test para liberar más pacientes al pool de desarrollo (train + val).
 TEST_RATIO = 0.21
 N_VAL_PATIENTS = 5 # Cantidad de pacientes que se reservan de train para VALIDACIÓN.
-# este paciente tiene q quedar en validación (val representativo de casos difíciles), este tiene crisis cortas que me hacen renegar así q las tiene q tener en cuenta para calibrar el umbral.
+#necesito dejar uno de los casos dificiles (crisis cortas) en cada uno de los splits
 VAL_REQUIRED_PATIENTS = ["chb14"]
+FORCED_TRAIN_PATIENTS = ["chb06"]
+FORCED_TEST_PATIENTS = ["chb16"]
 
 # Pacientes de crisis CORTAS forzados a train/test. El split por volumen mandaba
 # todos los casos cortos (chb06, chb14, chb16) fuera de train y la red nunca veía
@@ -132,7 +134,7 @@ THRESHOLD = 0.75
 # Criterio de selección del punto de operación a nivel EVENTO: techo clínico de
 # falsas alarmas por hora medido como MEDIANA por paciente (robusto a un paciente ruidoso). Entre los umbrales con mediana <= MAX_FALSE_ALARMS_PER_HOUR se elige el
 # de MAYOR sensibilidad de crisis (desempate: menor mediana de falsas alarmas).
-MAX_FALSE_ALARMS_PER_HOUR = 5.0
+MAX_FALSE_ALARMS_PER_HOUR = 1.0
 
 # Postprocesado a nivel EVENTO (crisis), como en el paper 1DCNN IEEE TNSRE 2025:
 # dispara una alarma si hay >= POSITIVES_FOR_EVENT predicciones positivas dentro de las últimas WINDOW_RANGE_FOR_EVENT ventanas consecutivas.
