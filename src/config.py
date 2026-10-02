@@ -77,6 +77,13 @@ N_VAL_PATIENTS = 5 # Cantidad de pacientes que se reservan de train para VALIDAC
 # este paciente tiene q quedar en validación (val representativo de casos difíciles), este tiene crisis cortas que me hacen renegar así q las tiene q tener en cuenta para calibrar el umbral.
 VAL_REQUIRED_PATIENTS = ["chb14"]
 
+# Pacientes de crisis CORTAS forzados a train/test. El split por volumen mandaba
+# todos los casos cortos (chb06, chb14, chb16) fuera de train y la red nunca veía
+# una crisis <25 s. Acá se garantiza que train vea morfología ictal corta (chb06)
+# y que test conserve el caso más difícil (chb16).
+FORCED_TRAIN_PATIENTS = ["chb06"]
+FORCED_TEST_PATIENTS = ["chb16"]
+
 # Peso relativo de los SEGUNDOS DE CRISIS frente a los ARCHIVOS en el reparto
 # codicioso del split. Los segundos de crisis determinan cuántas ventanas
 # POSITIVAS caen en test (de eso depende la sensibilidad medida); los archivos

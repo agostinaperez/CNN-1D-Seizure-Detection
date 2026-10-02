@@ -53,6 +53,9 @@ def split_config(split: dict) -> dict[str, Any]:
         "test": list(split.get("test", [])),
         "test_ratio": split.get("test_ratio_solicitado"),
         "n_val_patients": split.get("n_val_patients_config"),
+        "val_required_patients": list(split.get("val_required_patients", [])),
+        "forced_train_patients": list(split.get("forced_train_patients", [])),
+        "forced_test_patients": list(split.get("forced_test_patients", [])),
         "split_w_zsec": split.get("split_w_zsec"),
     }
 

@@ -1,11 +1,11 @@
 """
-Split inter-paciente 70/30 proporcional
+Split inter-paciente 80/20 proporcional
 
 Asigna pacientes COMPLETOS a Train/Val/Test para la generalización inter-paciente y q no haya fuga de datos.
 
 La asignación se hace por orden de "severidad" (segundos de crisis) para que train y test tengan una mezcla parecida de pacientes "graves" (con muchas crisis).
 Se usa una asignación codiciosa que mantiene, tanto en volumen de registro (n_files) como en duración de crisis (seizure_seconds), la fracción de test
-cerca de TEST_RATIO (30%).
+cerca de TEST_RATIO (20%).
 
 Salida: escribe data/processed/split.json con los conjuntos y el detalle.
 
@@ -24,11 +24,15 @@ from pathlib import Path
 from src.annotations import load_annotations, patient_seizure_stats
 from src.config import (
     DATASET_DIR,
+    FORCED_TEST_PATIENTS,
+    FORCED_TRAIN_PATIENTS,
     N_VAL_PATIENTS,
     PROCESSED_DIR,
     SPLIT_W_ZSEC,
     TEST_RATIO,
+    VAL_REQUIRED_PATIENTS,
 )
+from src.protocol import PROTOCOL_VERSION, split_id
 
 
 def split_dataset(
@@ -48,6 +52,11 @@ def split_dataset(
 
     Devuelve (train, test) con los códigos de paciente.
     """
+    if not 0.0 < test_ratio < 1.0:
+        raise ValueError("test_ratio debe estar entre 0 y 1")
+    if w_zsec < 0:
+        raise ValueError("w_zsec no puede ser negativo")
+
     # 1) Orden de "severidad": pacientes con más crisis primero, así los
     #    "graves" no se van todos juntos para el mismo lado al final.
     ordered = sorted(stats, key=lambda s: (s["seizure_seconds"], s["n_files"]), reverse=True)
@@ -60,9 +69,9 @@ def split_dataset(
     # La meta: train debe quedarse con el 70% (lo que no va a test).
     target_train = 1.0 - test_ratio
 
-    # Acumuladores: cuántos archivos / seg. de crisis ya repartimos a cada lado.
-    train_files = test_files = 0
-    train_zsec = test_zsec = 0.0
+    # Acumuladores: cuántos archivos / seg. de crisis ya repartí a train.
+    train_files = 0
+    train_zsec = 0.0
 
     train_patients: list[str] = []
     test_patients: list[str] = []
@@ -95,8 +104,6 @@ def split_dataset(
         # Elegimos la opción que menos se desvía (¿queda mejor en train o en test?).
         if dev_to_test < dev_to_train:
             test_patients.append(s["patient"])
-            test_files += f
-            test_zsec += zsec
         else:
             train_patients.append(s["patient"])
             train_files += f
@@ -105,27 +112,45 @@ def split_dataset(
     return train_patients, test_patients
 
 
-def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N_VAL_PATIENTS) -> list[str]:
+def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N_VAL_PATIENTS,
+                    required: list[str] | None = None) -> list[str]:
     """
     Elige N pacientes de validación DENTRO del conjunto de train.
 
-    se toman pacientes "del medio" en severidad para que la validación tenga una mezcla típica
-    de eventos. Si no alcanza el número pedido, se toma lo que haya.
+    - Primero se incluyen los pacientes OBLIGATORIOS (crisis cortas) para que la validación sea representativa del caso difícil.
+    - El resto se toma en posiciones "centrales" de severidad para que la validación tenga una mezcla típica de eventos.
+    - Los pacientes FORZADOS a train nunca se ofrecen como extras de validación.
     """
+    required = list(required or VAL_REQUIRED_PATIENTS)
+    if n_val < 0:
+        raise ValueError("n_val no puede ser negativo")
+
     # Mapa paciente -> severidad para ordenar.
     sev = {s["patient"]: s["seizure_seconds"] for s in stats}
 
-    # Ordenar los train por severidad ascendente (menos crisis -> más crisis).
-    train_sorted = sorted(train_patients, key=lambda p: sev.get(p, 0))
-
-    # Elegimos posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición
-    assert len(train_sorted) > n_val, (
-        "Se necesitan más pacientes de train que " f"{n_val} para reservar validación."
+    # Pacientes obligatorios que están disponibles en train.
+    forced = [p for p in required if p in train_patients]
+    missing = [p for p in required if p not in train_patients]
+    if missing:
+        print(f"[WARN] split.py: pacientes obligatorios de val no están en train: {missing}")
+    # Resto de train sin los obligatorios ni los forzados a train, ordenado por severidad ascendente.
+    remaining = sorted(
+        [p for p in train_patients if p not in forced and p not in FORCED_TRAIN_PATIENTS],
+        key=lambda p: sev.get(p, 0),
     )
-    idx = [(k * len(train_sorted)) // (n_val + 1) for k in range(1, n_val + 1)]
 
-    # Tomamos las n_val posiciones centrales disponibles.
-    val = [train_sorted[i] for i in idx if i < len(train_sorted)]
+    n_extra = n_val - len(forced)
+    if len(remaining) < n_extra:
+        raise ValueError(
+            f"No alcanzan los pacientes de train para reservar {n_val} de validación "
+            f"({len(remaining)} disponibles después de los obligatorios)."
+        )
+
+    # posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición.
+    idx = [(k * len(remaining)) // (n_extra + 1) for k in range(1, n_extra + 1)] if n_extra else []
+    extras = [remaining[i] for i in idx if i < len(remaining)]
+
+    val = forced + extras
     return val[:n_val]
 
 
@@ -149,8 +174,29 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
     if not stats:
         sys.exit("No hay pacientes con anotaciones")
 
-    # Split determinista (w_zsec pesa más los segundos de crisis para equilibrar).
-    train, test = split_dataset(stats, TEST_RATIO, SPLIT_W_ZSEC)
+    # Pacientes forzados a train/test por su duración de crisis (cortas), para que
+    # train vea morfología ictal corta y test conserve el caso más difícil.
+    all_patients = {s["patient"] for s in stats}
+    forced_train = [p for p in FORCED_TRAIN_PATIENTS if p in all_patients]
+    forced_test = [p for p in FORCED_TEST_PATIENTS if p in all_patients]
+    # Los pacientes que después se tallan a validación (VAL_REQUIRED_PATIENTS)
+    # tienen que estar primero en train; se los fuerza acá para que el reparto
+    # codicioso no los mande a test.
+    forced_train += [
+        p for p in VAL_REQUIRED_PATIENTS
+        if p in all_patients and p not in forced_train and p not in forced_test
+    ]
+    overlap = set(forced_train) & set(forced_test)
+    if overlap:
+        sys.exit(f"Paciente forzado a train y test a la vez: {sorted(overlap)}")
+    forced = set(forced_train) | set(forced_test)
+
+    # Split determinista (w_zsec pesa más los segundos de crisis para equilibrar)
+    # sobre los pacientes NO forzados; los forzados se suman al final.
+    rest_stats = [s for s in stats if s["patient"] not in forced]
+    train_rest, test_rest = split_dataset(rest_stats, TEST_RATIO, SPLIT_W_ZSEC)
+    train = forced_train + train_rest
+    test = forced_test + test_rest
 
     #Reservo validación desde train
     val = pick_validation(train, stats, N_VAL_PATIENTS)
@@ -183,9 +229,17 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
 
     total_files = sum(s["n_files"] for s in stats)
     total_zsec = sum(s["seizure_seconds"] for s in stats)
+    if total_files <= 0:
+        raise ValueError("No hay archivos EDF válidos para construir el split.")
     summary = {
+        "protocol_version": PROTOCOL_VERSION,
         "data_dir": str(data_dir),
         "test_ratio_solicitado": TEST_RATIO,
+        "n_val_patients_config": N_VAL_PATIENTS,
+        "val_required_patients": list(VAL_REQUIRED_PATIENTS),
+        "forced_train_patients": list(FORCED_TRAIN_PATIENTS),
+        "forced_test_patients": list(FORCED_TEST_PATIENTS),
+        "split_w_zsec": SPLIT_W_ZSEC,
         "n_train": len(train_eff),
         "n_val": len(val),
         "n_test": len(test),
@@ -203,9 +257,10 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
             ),
             "frac_test_seizure_seconds": round(
                 volume(test)["seizure_seconds"] / total_zsec, 4
-            ),
+            ) if total_zsec > 0 else 0.0,
         },
     }
+    summary["split_id"] = split_id(summary)
     return summary
 
 

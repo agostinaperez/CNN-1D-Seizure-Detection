@@ -20,7 +20,7 @@ import numpy as np
 import scipy.signal
 from sklearn.preprocessing import RobustScaler
 
-from src.annotations import load_annotations
+from src.annotations import files_for_patient, load_annotations
 from src.config import (
     CHANNELS_TUEV,
     DATASET_DIR,
@@ -36,8 +36,9 @@ from src.config import (
     STATS_WINDOW_STRIDE,
     STRIDE_SAMPLES,
     WIN_SAMPLES,
-    WIN_SECONDS,
+    WIN_SECONDS_EFFECTIVE,
 )
+from src.protocol import PROTOCOL_VERSION, preprocessing_config, scaler_id, split_id
 
 # En EEG, cada canal mide una diferencia de potencial entre 2 electrodos.
 # - Montaje monopolar: cada canal es un electrodo contra una referencia común (ej. "F7-CS2").
@@ -90,7 +91,6 @@ def _solve_selection(normalized_edf_channels: list[str]) -> dict | None:
     #NO ME DEVUELVE LOS CANALES RECONSTRUIDOS PQ ESTO SE LLAMA EN VARIOS LUGARES
     #PERO SI ME DEVUELVE LAS INSTRUCCIONES DE COMO HACER ESA RECONSTRUCCION, ESO SERÍA MI PLAN
     plan: dict[str, tuple] = {}
-    mode = "direct" #valor inicial
     for channel_pair in VALID_CHANNELS:
         #el for corre 16 veces, uno x canal
         # Si el canal q quiero ya existe en este edf como bipolar directo, anoto en el plan q solo tomo su fila y listo.
@@ -100,27 +100,17 @@ def _solve_selection(normalized_edf_channels: list[str]) -> dict | None:
         
         # sino, se que para este EDF, a este canal lo reconstruyo por resta
         a, b = channel_pair.split("-")
-        #en la primer pasada entro acá, y defino q estructura tienen los canales a reconstruir de este archivo
-        if mode == "direct":
-            common_refs = [r for r in monopolares if a in monopolares[r] and b in monopolares[r]]
-            if a in unicos and b in unicos:        #electrodos únicos
-                mode = "single"
-            elif common_refs:                        # ref común (ej. CS2)
-                mode = f"ref:{common_refs[0]}"
-            else:
-                return None                          # no hay forma de armar el par
-
-        if mode == "single":
+        # Resolver cada canal de forma independiente permite montajes mixtos.
+        if a in unicos and b in unicos:
             # Resto: A - B usando los electrodos únicos.
-            if a not in unicos or b not in unicos:
-                return None
             plan[channel_pair] = ("diff", unicos[a], unicos[b])
         else:
             # Modo "ref:CS2": resto dos canales que comparten la MISMA ref.
             # FP1-F7 = (FP1-CS2) - (F7-CS2). La CS2 se cancela → queda FP1-F7.
-            ref = mode.split(":", 1)[1]
-            if ref not in monopolares or a not in monopolares[ref] or b not in monopolares[ref]:
+            common_refs = [r for r in monopolares if a in monopolares[r] and b in monopolares[r]]
+            if not common_refs:
                 return None
+            ref = common_refs[0]
             plan[channel_pair] = ("diff", monopolares[ref][a], monopolares[ref][b])
 
     return plan
@@ -534,7 +524,8 @@ def _train_files_from_split(data_dir: Path, split: dict) -> list[Path]:
     return files
 
 
-def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients: list[str] | None) -> None:
+def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients: list[str] | None, out: Path = SCALER_STATS_FILE,) -> None:
+    # Lee el split para saber qué pacientes forman el train del scaler.
     split = json.loads(split_file.read_text(encoding="utf-8"))
     annotations = load_annotations(data_dir)
 
@@ -547,7 +538,7 @@ def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients:
         train_files = [p for p in train_files if p.parent.name in wanted]
         if not train_files:
             sys.exit("Ningún archivo de los pacientes pedidos quedó en TRAIN.")
-    if limit:
+    if limit is not None:
         train_files = train_files[:limit]
 
     files_by_name = {p.name: p for p in train_files}
@@ -593,6 +584,8 @@ def test_file_cli(data_dir: Path, edf_path: str, scaler_stats_path: Path = SCALE
     if not res["ok"]:
         sys.exit(f"[FAIL] {res['reason']}")
     windows, labels, starts = res["windows"], res["labels"], res["starts"]
+    if windows.shape[0] == 0:
+        sys.exit("[FAIL] el EDF no contiene ventanas completas")
     print(f"Ventanas: {windows.shape}  (n, canales, muestras)")
     print(f"Labels: {labels.sum()} positivas de {len(labels)} "
           f"({100 * labels.mean():.2f}%)")
@@ -601,7 +594,8 @@ def test_file_cli(data_dir: Path, edf_path: str, scaler_stats_path: Path = SCALE
     # cada canal quede centrado en mediana~0 con IQR~1 (lo que garantiza el RobustScaler).
     print("\nControl del escalado robusto por canal (tras stats de TRAIN: mediana~0, IQR~1):")
     try:
-        stats = load_scaler_stats()
+        # Usa explícitamente el scaler pedido para esta prueba del EDF.
+        stats = load_scaler_stats(scaler_stats_path)
     except RuntimeError as exc:
         # El npz viejo es de z-score/min-max: se avisa y se sigue sin el control.
         print(f"   (aviso: {exc})")
@@ -620,6 +614,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Preprocesamiento de EDFs CHB-MIT")
     parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
     parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
+    parser.add_argument(
+        "--stats-out",
+        type=str,
+        default=str(SCALER_STATS_FILE),
+        help="Ruta del scaler .npz a generar.",
+    )
+    parser.add_argument(
+        "--scaler-stats",
+        type=str,
+        default=str(SCALER_STATS_FILE),
+        help="Ruta del scaler .npz a usar en --test-file.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Procesar solo N archivos (smoke-test).")
     parser.add_argument("--patients", type=str, default=None, help="Solo estos pacientes (csv).")
 
@@ -631,6 +637,9 @@ def main() -> None:
 
     # lee sys.argv, chequea que los flags sean válidos
     args = parser.parse_args()
+
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit debe ser mayor que cero")
     
     data_dir = Path(args.data_dir)
     if not data_dir.is_dir():
@@ -638,11 +647,17 @@ def main() -> None:
 
     if args.compute_stats:
         patients = args.patients.split(",") if args.patients else None
-        compute_stats(data_dir, Path(args.split_file), args.limit, patients)
+        compute_stats(
+            data_dir,
+            Path(args.split_file),
+            args.limit,
+            patients,
+            Path(args.stats_out),
+        )
 
     #test para un solo archivo (no es para prod)
     else: 
-        test_file_cli(data_dir, args.test_file)
+        test_file_cli(data_dir, args.test_file, Path(args.scaler_stats))
 
 
 if __name__ == "__main__":
