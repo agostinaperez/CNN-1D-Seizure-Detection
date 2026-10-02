@@ -137,11 +137,13 @@ def load_16_channels(path, fs_expected: int = FS) -> tuple[np.ndarray | None, st
     raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
     sampling_rate = float(raw.info["sfreq"])
     if abs(sampling_rate - fs_expected) > 1e-6:
+        raw.close()
         return None, f"sampling_rate_invalida ({sampling_rate:g} Hz != {fs_expected})"
 
     normalized_edf_channels = [normalize_channel_name(c) for c in raw.ch_names]
     plan = _solve_selection(normalized_edf_channels)
     if plan is None:
+        raw.close()
         return None, "channels_incompatible"
     
     #acá ejecuto el dichoso plan! 
@@ -165,6 +167,7 @@ def load_16_channels(path, fs_expected: int = FS) -> tuple[np.ndarray | None, st
             # La referencia se cancela, queda el canal bipolar puro
             #LA RESTA ES DE LA FILA COMPLETA, X ENDE ELEMENTO A ELEMENTO
             out[k] = data[op[1]] - data[op[2]]
+    raw.close()
     return out, None
 
 
@@ -174,6 +177,9 @@ def filter_bandpass(data: np.ndarray, fs: int = FS, low: float = LOW_FREQ, high:
     Butterworth pasa-banda con fase 0 para evitar distorsion temporal. Filtra a lo largo del eje 1  de cada canal.
     """
     
+    if fs <= 0 or order <= 0 or not 0 < low < high < fs / 2:
+        raise ValueError("Parámetros inválidos para el filtro pasabanda")
+
     #construyo la heramienta matemática para filtrar. especifico que es de tipo "bandpass",
     #pido q me lo devuelva en formato "sos" (second order sections) para que no me devuelva una única ecuación gigante.
     #pq, al final del día, el filtro es un polinomio de orden 5 en mi caso, entonces se puede hacer lío con los decimales
@@ -181,8 +187,10 @@ def filter_bandpass(data: np.ndarray, fs: int = FS, low: float = LOW_FREQ, high:
     #Eentonces aplica filtritos seguidos
     butterworth_filter = scipy.signal.butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
     #acá agarro el filtro y se lo paso a mis datos en la dimensión 1 (el del tiempo, pq la dimensión 0 son los canales)
-    #ese sosfiltfitl básicmanete hace que sea de "fase 0", porque filtra de izq a derecha y desp de derecha a izq cosa de anular
-    #cualquier desfase temporal
+    #sosfiltfilt es la versión de fase cero: filtra de izq a derecha, después invierte y
+    #filtra de derecha a izq, y así se anula el desfase temporal. Por eso NO retarda la señal.
+    #El precio es que no es causal (mira al futuro) y que aplica el filtro DOS veces, con lo
+    #que la respuesta en magnitud queda al cuadrado
     return scipy.signal.sosfiltfilt(butterworth_filter, data, axis=1)
 
 
@@ -193,6 +201,9 @@ def segment_windows(data: np.ndarray, win_samples: int = WIN_SAMPLES, stride: in
     Devuelve (windows float32, indices_inicio en muestras).
     Sólo se emiten ventanas COMPLETAS: la sobra al final se descarta.
     """
+    if data.ndim != 2 or win_samples <= 0 or stride <= 0:
+        raise ValueError("Datos o parámetros de segmentación inválidos")
+
     n = data.shape[1] #me devuelve la cantidad de elementos que tengo en la dimensión temporal
     
     #calculo la cantidad de ventanas que tengo en este archivo. Tomo todas mis muestras, les resto la cantidad total de muestras por ventana (de ahí ya saco mi primer ventana, x eso el +1)
@@ -209,16 +220,14 @@ def segment_windows(data: np.ndarray, win_samples: int = WIN_SAMPLES, stride: in
     #ahora sí aplico mi stride y hago el guardado físico en la memoria RAM. 
     #adentro de view tengo tres comas, cada una da una instrucción a una dimensión de la matriz view. En la dimensión 0 y la 2 pongo :, o sea digo q me de todo y sin recortar!
     #en la 1 hago ::stride -> la regla es escribir inicio:fin:paso . Así q mantengo el inicio y el fin, pero aplico el solapamiento que yo definí
-    windows = np.ascontiguousarray(view[:, ::stride, :])  # (C, W, WS)
-    #ahora acomodo las dimensiones de la matriz, porque pytorch exige que el lote de muestras sea la 1er dimensión (la 0)
-    #guardo los decimales a 32 bits (estaban en 64) para q los datos pesen menos y se acelere el entrenamiento (no me hace falta tener 64 bits)
-    windows = np.transpose(windows, (1, 0, 2)).astype(np.float32)
+    # UNA sola copia contigua ya en float32:
+    windows = np.ascontiguousarray(view[:, ::stride, :].transpose(1, 0, 2), dtype=np.float32)  # (W, C, WS)
     #creo el "anotador". Agarro la cantidad de ventanas q voy a tener (ej 10), lo hago array (0, 1, 2, 3,...) y multiplico x mi stride (655), entonces queda (0, 655, 1310,...) y sé donde arranca cada ventana
     starts = np.arange(n_windows, dtype=np.int64) * stride
     return windows, starts
 
 
-def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[int, int]], fs: int = FS, win_seconds: float = WIN_SECONDS) -> np.ndarray:
+def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[int, int]], fs: int = FS, win_seconds: float = WIN_SECONDS_EFFECTIVE) -> np.ndarray:
     """
     Etiqueta binaria: una ventana es CRISIS (1) si solapa cualquier porción de un intervalo de crisis anotado; si no, NO CRISIS (0).
     """
@@ -242,11 +251,14 @@ def label_windows(windows_starts: np.ndarray, n_win: int, seizures: list[tuple[i
 
 # Escalado robusto por canal
 def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tuple[int, int]]],
-                         scaler: str = SCALER, verbose: bool = True) -> dict:
+                          scaler: str = SCALER, verbose: bool = True) -> dict:
     """
     Recorre los archivos indicados, arma las ventanas filtradas y estima las estadísticas del RobustScaler por canal sobre TODAS esas ventanas:
     Devuelve un diccionario con las stats + el detalle de cuántos archivos/ventanas/puntos se usaron para estimar los cuantiles.
     """
+
+    if scaler != "robust":
+        raise ValueError(f"Scaler no soportado: {scaler!r}. Solo se admite 'robust'.")
 
     # guardar todas las muestras temporales de train es inviable, así q acumulo una VERSIÓN SUBMUESTREADA de las ventanas:
     #   - 1 de cada STATS_WINDOW_STRIDE ventanas,
@@ -272,6 +284,10 @@ def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tu
             continue
         
         windows = res["windows"]  # (n_ventanas, 16 canales, 1310 muestras)
+        if windows.shape[0] == 0:
+            if verbose:
+                print(f"   [skip] {path.parent.name}/{path.name}: sin ventanas completas")
+            continue
         # Submuestreo aleatorio: 1 de cada STATS_WINDOW_STRIDE ventanas al azar; dentro de cada ventana, 1 de cada STATS_SAMPLE_STRIDE muestras al azar (no es estratificado igual,
         # profe si llega a estar leyendo esto, no sé si debería hacerlo estratificado o no pero me parece que con que sea proporcionalmente 1/16 muestras al azar estoy bien)
         # Un muestreo uniforme aleatorio no sesga los cuantiles (mediana/IQR) pq es robusto!
@@ -317,7 +333,7 @@ def preprocess_train_data(files: list[Path], seizures_by_file: dict[str, list[tu
     del bloques, X  # libero las matrices gigantes y los bloques de la memoria
 
     stats = {
-        "scaler": "robust",
+        "scaler": scaler,
         "channels": VALID_CHANNELS,
         "n_files": ok_files_counter,
         "n_windows": number_of_windows,
@@ -343,6 +359,12 @@ def save_stats(stats: dict, out: Path = SCALER_STATS_FILE) -> Path:
         "n_points": np.array([stats["n_points"]]),  # puntos (submuestreados) usados para los cuantiles
         "median": stats["median"],                   # mediana por canal (center_ del RobustScaler)
         "iqr": stats["iqr"],                         # IQR (Q75 - Q25) por canal (scale_ del RobustScaler)
+        "protocol_version": np.array([stats.get("protocol_version", PROTOCOL_VERSION)]),
+        "split_id": np.array([stats.get("split_id") or ""]),
+        "scaler_id": np.array([stats.get("scaler_id") or scaler_id(stats)]),
+        "preprocessing_config": np.array([
+            json.dumps(stats.get("preprocessing_config", preprocessing_config()), sort_keys=True)
+        ]),
     }
     np.savez_compressed(out, **arrays)
     return out
@@ -371,6 +393,13 @@ def load_scaler_stats(path: Path = SCALER_STATS_FILE) -> dict | None:
             "n_points": int(z["n_points"][0]) if "n_points" in z.files else 0,
             "median": z["median"],  # mediana por canal (center_ del RobustScaler)
             "iqr": z["iqr"],        # IQR (Q75 - Q25) por canal (scale_ del RobustScaler)
+            "protocol_version": int(z["protocol_version"][0]) if "protocol_version" in z.files else None,
+            "split_id": str(z["split_id"][0]) if "split_id" in z.files else None,
+            "scaler_id": str(z["scaler_id"][0]) if "scaler_id" in z.files else None,
+            "preprocessing_config": (
+                json.loads(str(z["preprocessing_config"][0]))
+                if "preprocessing_config" in z.files else None
+            ),
         }
     return stats
 
@@ -383,15 +412,25 @@ def apply_scaler(windows: np.ndarray, stats: dict | None) -> np.ndarray:
     """
     if stats is None or windows.shape[0] == 0:
         return windows
+
+    expected_channels = len(VALID_CHANNELS)
+    channels = stats.get("channels")
+    median = np.asarray(stats.get("median"))
+    iqr = np.asarray(stats.get("iqr"))
+    if channels != VALID_CHANNELS:
+        raise ValueError("Las estadísticas del scaler no coinciden con VALID_CHANNELS")
+    if median.shape != (expected_channels,) or iqr.shape != (expected_channels,):
+        raise ValueError("Las estadísticas del scaler tienen dimensiones inválidas")
+    if not np.isfinite(median).all() or not np.isfinite(iqr).all() or (iqr < 0).any():
+        raise ValueError("Las estadísticas del scaler contienen valores inválidos")
+    if windows.ndim != 3 or windows.shape[1] != expected_channels:
+        raise ValueError("Las ventanas no tienen la cantidad esperada de canales")
     
-    w = windows.astype(np.float64) #copia mi arreglo y cambia el tipo de datos a 64 bits para q la resta y división sea precisa. Después lo vuelvo a 32 por los motivmos mencionados en otras funciones
-    
-    
-    median = stats["median"][:, None]  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
+    median = median[:, None].astype(np.float32)  # median es un vector de 16 números (una mediana x canal), están ordenadas en en orden de los canales. Le añado una nueva dimensión
     #así median queda de (16, 1) y se alínea (desde la derecha) con w que es (numero_de_ventanas, 16, 1310). Los 16 quedan alineaditos
-    iqr = stats["iqr"][:, None]        # IQR por canal (hago lo mismo q hice con median recién)
-    
-    denom = np.where(iqr == 0, 1.0, iqr)#evito dividir por 0 entonces si en algún canal x error quedó el iqr 0 (sería q tuvo valores ctes todo el tiempo), lo seteo en 1
+    iqr = iqr[:, None].astype(np.float32)        # IQR por canal (hago lo mismo q hice con median recién)
+
+    denom = np.where(iqr == 0, np.float32(1.0), iqr)#evito dividir por 0 entonces si en algún canal x error quedó el iqr 0 (sería q tuvo valores ctes todo el tiempo), lo seteo en 1
 
     # QUÉ PASA ACÁ (broadcasting), con un ejemplo pq me pongo gagá y me cuesta seguirlo. Los array de numpy son muy exóticos
     #
@@ -427,8 +466,11 @@ def apply_scaler(windows: np.ndarray, stats: dict | None) -> np.ndarray:
     #        ... y así con cada canal y cada ventana.
     #
     #   Después se divide cada valor por denom[canal] (el IQR de ESE canal), y listo: cada canal queda centrado y re-escalado por SU propia mediana e IQR, sin que un canal se mezcle con otro.
-    out = (w - median) / denom
-    return out.astype(np.float32)
+    # Todo se hace en float32 e in-place: así NO materializo copias float64 de las ventanas (ahorra ~2-4x RAM en archivos largos).
+    w = windows.astype(np.float32, copy=True)
+    w -= median
+    w /= denom
+    return w
 
 
 # Pipeline completo de un archivo
@@ -446,34 +488,41 @@ def process_edf(path, seizures: list[tuple[int, int]], *, fs: int = FS, win_samp
     if not Path(path).exists():
         return {"ok": False, "reason": "archivo_no_existe"}
 
+    if fs <= 0 or win_samples <= 0 or stride <= 0:
+        return {"ok": False, "reason": "parametros_de_segmentacion_invalidos"}
+
+    try:
+        
     #matriz_señales es la matriz en la que cada fila es un canal (Ya reconstruido) y c columna contiene la amplitud
     #de la señal en cada instante de tiempo
-    matriz_señales, reason = load_16_channels(path, fs_expected=fs)
-    if matriz_señales is None:
-        return {"ok": False, "reason": reason}
-
+        matriz_señales, reason = load_16_channels(path, fs_expected=fs)
+        if matriz_señales is None:
+            return {"ok": False, "reason": reason}
     #hago el butterworth
-    filtered = filter_bandpass(matriz_señales, fs=fs)
-    #filtro las ventanas
-    windows, starts = segment_windows(filtered, win_samples=win_samples, stride=stride)
-    #obtengo mi cantidad de ventanas (ahora es mi dimensión 0 después del transpose q hice)
-    n_win = windows.shape[0]
-    #hago una clasificación binaria de las ventanas del archivo. 1 si se superpone con algún instante de crisis, 0 si no.
-    labels = label_windows(starts, n_win, seizures, fs=fs)
-    
-    if do_scale:
-        windows = apply_scaler(windows, scaler_stats)
-    #devuelvo toda la datita
-    return {
-        "ok": True,
-        "file": Path(path).name,
-        "windows": windows,
-        "labels": labels,
-        "starts": (starts / fs).astype(np.float64),
-        "n_windows": n_win,
-        "n_positive": int(labels.sum()),
-        "fs": fs,
-    }
+        filtered = filter_bandpass(matriz_señales, fs=fs).astype(np.float32)
+        del matriz_señales
+        #filtro las ventanas
+        windows, starts = segment_windows(filtered, win_samples=win_samples, stride=stride)
+         #obtengo mi cantidad de ventanas (ahora es mi dimensión 0 después del transpose q hice)
+        n_win = windows.shape[0]
+        #hago una clasificación binaria de las ventanas del archivo. 1 si se superpone con algún instante de crisis, 0 si no.
+        labels = label_windows(starts, n_win, seizures, fs=fs, win_seconds=win_samples / fs,)
+
+        if do_scale:
+            windows = apply_scaler(windows, scaler_stats)
+
+        return {
+            "ok": True,
+            "file": Path(path).name,
+            "windows": windows,
+            "labels": labels,
+            "starts": (starts / fs).astype(np.float64),
+            "n_windows": n_win,
+            "n_positive": int(labels.sum()),
+            "fs": fs,
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 # HELPERS DEL CLI---------------------------------------------------------------------
 
@@ -481,17 +530,7 @@ def _train_files_from_split(data_dir: Path, split: dict) -> list[Path]:
     """Lista de EDFs (solo los anotados en el summary) para los pacientes de train."""
     files: list[Path] = []
     for patient in split["train"]:
-        summary = data_dir / patient / f"{patient}-summary.txt"
-        if not summary.exists():
-            print(f"[WARN] {patient}: no tiene summary; se omite.")
-            continue
-        from src.annotations import parse_summary
-        for fname in parse_summary(summary):
-            p = data_dir / patient / fname
-            if p.exists():
-                files.append(p)
-            else:
-                print(f"[WARN] {patient}/{fname} anotado pero no existe en disco.")
+        files.extend(files_for_patient(data_dir, patient))
     return files
 
 
@@ -522,15 +561,20 @@ def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients:
           f"{len(train_files)} archivos de TRAIN...")
     
     stats = preprocess_train_data(train_files, seizures_by_file)
-    save_stats(stats)
+    stats["protocol_version"] = PROTOCOL_VERSION
+    stats["split_id"] = split_id(split)
+    stats["scaler_id"] = scaler_id(stats)
+    stats["preprocessing_config"] = preprocessing_config()
+    # Guarda las estadísticas en la ruta específica del escenario o del modelo final.
+    save_stats(stats, out)
     
-    print(f"Stats guardadas en: {SCALER_STATS_FILE}")
+    print(f"Stats guardadas en: {out}")
     print("\nmediana por canal (center_):", np.array2string(stats["median"], precision=3, suppress_small=False))
     print("IQR por canal (scale_):     ", np.array2string(stats["iqr"], precision=3, suppress_small=False))
     print(f"Ventanas de train usadas: {stats['n_windows']} | archivos: {stats['n_files']}")
     print(f"(mediana e IQR estimados sobre {stats['n_points']} puntos submuestreados)")
 
-def test_file_cli(data_dir: Path, edf_path: str) -> None:
+def test_file_cli(data_dir: Path, edf_path: str, scaler_stats_path: Path = SCALER_STATS_FILE,) -> None:
     """CLI --test-file: procesa un único EDF y muestra un resumen (smoke-test)."""
     path = Path(edf_path)
     if not path.exists():

@@ -73,7 +73,6 @@ ia-final/
     ├── model.py                 <- arquitectura CNN-1D apilada
     ├── train.py                 <- loop de entrenamiento + métricas + checkpoint
     ├── evaluate.py              <- evaluación inter-paciente (val/test)
-    ├── select_best.py           <- selección del mejor escenario por validación
     └── inference.py             <- CLI de inferencia sobre .edf
 ```
 
