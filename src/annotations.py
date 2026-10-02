@@ -23,6 +23,36 @@ _RE_START = re.compile(r"^Seizure\s+(?:\d+\s+)?Start Time:\s+(\d+)")
 _RE_END = re.compile(r"^Seizure\s+(?:\d+\s+)?End Time:\s+(\d+)")
 
 
+def is_safe_edf_name(name: str) -> bool:
+    """Indica si `name` es un nombre EDF relativo y sin componentes de ruta."""
+    candidate = Path(name)
+    return (
+        bool(name)
+        and not candidate.is_absolute()
+        and candidate.name == name
+        and candidate.suffix.lower() == ".edf"
+    )
+
+
+def patient_dir(data_dir: Path | str, patient: str) -> Path:
+    """Resuelve un directorio de paciente sin permitir escapar del dataset."""
+    root = Path(data_dir).resolve()
+    resolved = (root / patient).resolve()
+    if resolved.parent != root:
+        raise ValueError(f"Paciente fuera del dataset: {patient!r}")
+    return resolved
+
+
+def edf_path(data_dir: Path | str, patient: str, filename: str) -> Path:
+    """Resuelve un EDF validando paciente, nombre y extensión."""
+    if not is_safe_edf_name(filename):
+        raise ValueError(f"Nombre de EDF inválido: {filename!r}")
+    resolved = patient_dir(data_dir, patient) / filename
+    if resolved.parent != patient_dir(data_dir, patient):
+        raise ValueError(f"EDF fuera del directorio del paciente: {filename!r}")
+    return resolved
+
+
 def discover_patients(data_dir: Path | str = DATASET_DIR) -> list[str]:
     data_dir = Path(data_dir)
 
@@ -45,7 +75,7 @@ def discover_patients(data_dir: Path | str = DATASET_DIR) -> list[str]:
 
 def summary_path_for(patient: str, data_dir: Path | str = DATASET_DIR) -> Path:
     #Ruta del archivo de resumen de un paciente: `<carpeta>/<paciente>-summary.txt`.
-    return Path(data_dir) / patient / f"{patient}-summary.txt"
+    return patient_dir(data_dir, patient) / f"{patient}-summary.txt"
 
 
 def parse_summary(summary_path: Path | str) -> dict[str, list[tuple[int, int]]]:
@@ -73,7 +103,15 @@ def parse_summary(summary_path: Path | str) -> dict[str, list[tuple[int, int]]]:
             # la línea "File Name: ..." indica q cambié de archivo
             m = _RE_FILE.match(line)
             if m:
-                current_file = m.group(1).strip()
+                if pending_start is not None and current_file is not None:
+                    print(f"[WARN] {summary_path.name}: crisis sin hora de fin en {current_file}")
+                candidate = m.group(1).strip()
+                if not is_safe_edf_name(candidate):
+                    print(f"[WARN] {summary_path.name}: nombre de EDF inválido: {candidate!r}")
+                    current_file = None
+                    pending_start = None
+                    continue
+                current_file = candidate
                 # Inicializo la lista de crisis para este arvchivo (si no tiene crisis, queda vacío y listo)
                 seizures.setdefault(current_file, [])
                 # reinicio esto para q no queden valores cruzados
@@ -94,7 +132,11 @@ def parse_summary(summary_path: Path | str) -> dict[str, list[tuple[int, int]]]:
                 # no puede terminar antes de empezar.
                 if end >= pending_start:
                     seizures[current_file].append((pending_start, end)) #formo el invervalo de segundos de inicio y de fin de la crisis
+                else:
+                    print(f"[WARN] {summary_path.name}: intervalo inválido en {current_file}: {pending_start}-{end}")
                 pending_start = None #limpio el valor
+    if pending_start is not None and current_file is not None:
+        print(f"[WARN] {summary_path.name}: crisis sin hora de fin en {current_file}")
     return {k: v for k, v in seizures.items() if k} #devuelvo solamente los valores con nombre de archivo no vacío x si quedó alguna línea rari
 
 
@@ -109,11 +151,40 @@ def load_annotations(data_dir: Path | str = DATASET_DIR) -> dict[str, dict]:
     for patient in discover_patients(data_dir):
         summary = summary_path_for(patient, data_dir)
         if summary.exists():
-            annotations[patient] = parse_summary(summary)
+            parsed = parse_summary(summary)
+            existing: dict[str, list[tuple[int, int]]] = {}
+            for filename, intervals in parsed.items():
+                path = edf_path(data_dir, patient, filename)
+                if path.is_file():
+                    existing[filename] = intervals
+                else:
+                    print(f"[WARN] {patient}/{filename}: anotado pero no existe en disco; se omite.")
+            annotations[patient] = existing
         else:
             print(f"[WARN] {patient}: no tiene {summary.name}; se omite.")
 
     return annotations
+
+
+def files_for_patient(data_dir: Path | str, patient: str) -> list[Path]:
+    """Devuelve los EDF existentes mencionados en el summary del paciente."""
+    try:
+        summary = summary_path_for(patient, data_dir)
+    except ValueError as exc:
+        print(f"[WARN] {patient}: ruta de paciente inválida ({exc}); se omite.")
+        return []
+    if not summary.exists():
+        print(f"[WARN] {patient}: no tiene summary; se omite.")
+        return []
+
+    files: list[Path] = []
+    for filename in parse_summary(summary):
+        path = edf_path(data_dir, patient, filename)
+        if path.is_file():
+            files.append(path)
+        else:
+            print(f"[WARN] {patient}/{filename}: anotado pero no existe en disco.")
+    return files
 
 
 def patient_seizure_stats(annotations: dict[str, dict],) -> list[dict]:
