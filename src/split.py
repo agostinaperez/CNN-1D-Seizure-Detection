@@ -48,6 +48,11 @@ def split_dataset(
 
     Devuelve (train, test) con los códigos de paciente.
     """
+    if not 0.0 < test_ratio < 1.0:
+        raise ValueError("test_ratio debe estar entre 0 y 1")
+    if w_zsec < 0:
+        raise ValueError("w_zsec no puede ser negativo")
+
     # 1) Orden de "severidad": pacientes con más crisis primero, así los
     #    "graves" no se van todos juntos para el mismo lado al final.
     ordered = sorted(stats, key=lambda s: (s["seizure_seconds"], s["n_files"]), reverse=True)
@@ -60,9 +65,9 @@ def split_dataset(
     # La meta: train debe quedarse con el 70% (lo que no va a test).
     target_train = 1.0 - test_ratio
 
-    # Acumuladores: cuántos archivos / seg. de crisis ya repartimos a cada lado.
-    train_files = test_files = 0
-    train_zsec = test_zsec = 0.0
+    # Acumuladores: cuántos archivos / seg. de crisis ya repartí a train.
+    train_files = 0
+    train_zsec = 0.0
 
     train_patients: list[str] = []
     test_patients: list[str] = []

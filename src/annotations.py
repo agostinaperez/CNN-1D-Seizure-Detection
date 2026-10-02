@@ -218,12 +218,16 @@ def patient_seizure_stats(annotations: dict[str, dict],) -> list[dict]:
         # Suma de duraciones de todas sus crisis (en segundos).
         seizure_seconds = sum(end - start for start, end in all_intervals)
 
+        # Duración promedio por crisis
+        mean_seizure_seconds = seizure_seconds / n_seizures if n_seizures else 0.0
+
         stats.append(
             {
                 "patient": patient,
                 "n_files": n_files,
                 "n_seizures": n_seizures,
                 "seizure_seconds": seizure_seconds,
+                "mean_seizure_seconds": mean_seizure_seconds,
             }
         )
 
