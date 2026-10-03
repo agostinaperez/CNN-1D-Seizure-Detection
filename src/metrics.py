@@ -5,15 +5,16 @@ Métricas de evaluación para detección de crisis.
   - Nivel EVENTO (crisis): sensibilidad + tasa de falsas alarmas por hora + latencia, con postprocesado "n positivos en N ventanas consecutivas" + intervalo mínimo entre alarmas
 
 También expone:
-  - `select_operating_point`: el umbral con MENOR tasa de falsas alarmas por hora que cumpla sensibilidad >= objetivo
-    (lo que uso para elegir el mejor checkpoint en train)
+  - `select_event_operating_point`: el umbral con MAYOR sensibilidad de evento
+    bajo el techo de falsas alarmas (lo que usa train para elegir checkpoint)
 """
 
 from __future__ import annotations
 
 import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score
 
-from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.config import EVENT_PRE_ONSET_TOLERANCE, FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
 from src.protocol import THRESHOLD_GRID
 from src.timing import decision_times_from_local_ids
 
@@ -92,9 +93,45 @@ def binary_metrics(probs, labels, threshold: float, *, file_ids=None, local_ids=
         "false_negative": fn,
     }
 
+def rank_metrics(probs, labels) -> dict:
+    """
+    Calidad de RANKING del clasificador, independiente del umbral.
+
+      - AUC-ROC: probabilidad de ordenar una ventana positiva por encima de una negativa.
+      - AUPRC (average precision): área bajo la curva precisión-recall; es la métrica
+        de ranking recomendada bajo desbalance extremo (AUROC "premia" el desbalance).
+
+    Ambas miden si el modelo separa crisis de no-crisis más allá de qué umbral se elija.
+    Devuelve None para la métrica que no se pueda calcular (p. ej. sin positivas).
+    """
+    probs = np.asarray(probs).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    if probs.shape != labels.shape or probs.size == 0:
+        raise ValueError("probs y labels deben ser no vacíos y de igual longitud")
+
+    n_pos = int((labels == 1).sum())
+    n_neg = int((labels == 0).sum())
+
+    auc_roc = None
+    if n_pos > 0 and n_neg > 0:
+        auc_roc = float(roc_auc_score(labels, probs))
+
+    auprc = None
+    if n_pos > 0:
+        auprc = float(average_precision_score(labels, probs))
+
+    return {
+        "auc_roc": auc_roc,
+        "auprc": auprc,
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+    }
+
+
 def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                   threshold: float, n_within: int = 3, n_window: int = 4,
-                  min_alarm_interval: float = 30.0, max_latency: float = 30.0) -> dict:
+                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                  pre_onset_tolerance: float = EVENT_PRE_ONSET_TOLERANCE) -> dict:
     """
     Evaluación a nivel evento (como en el paper 1DCNN IEEE TNSRE 2025).
     Evalúa un umbral fijo así q lo llamo barias veces desde select_event_operating_point para que me decida cuál es mejor
@@ -104,6 +141,8 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
     labels = np.asarray(labels).reshape(-1)
     file_ids = np.asarray(file_ids)
     local_ids = np.asarray(local_ids)
+    if pre_onset_tolerance < 0:
+        raise ValueError("pre_onset_tolerance no puede ser negativo")
 
     pred = probs >= threshold
     total_hours = _span_hours_by_file(file_ids, local_ids)
@@ -140,7 +179,9 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
     n_detected = 0
     n_false_alarms = 0
     n_alarms = 0
+    n_early_detections = 0
     latencies: list[float] = []
+    lead_times: list[float] = []
     by_patient: dict[str, dict] = {}
 
     for fid, path in enumerate(valid_files): #recorro los archivos del splot
@@ -149,20 +190,32 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         n_alarms += len(file_alarms)
         matched = [False] * len(file_alarms) #Lista de flags para saber si cada alarma fue matcheada con una crisis anotada
         file_detected = 0
+        file_early_detections = 0
         file_latencies: list[float] = []
+        file_lead_times: list[float] = []
         for onset, _end in seizures: #recorro cada crisis
             n_seizures += 1
             det_time = None #tiempo de detección de la crisis, si se detecta
             for k, t in enumerate(file_alarms):
                 if matched[k]: #si la alarma esta ya la use, la salteo
                     continue
-                if onset <= t <= onset + max_latency: #si la alarma cae dentro del rango de latencia permitido (o sea entre q arranca y los 30segs), la matcheo con la crisis
+                if onset - pre_onset_tolerance <= t <= onset + max_latency:
                     matched[k] = True
                     det_time = t
                     break
             if det_time is not None: #la guardo en "detectadas", calculo la latencia
                 n_detected += 1
-                latency = det_time - onset
+                if det_time < onset:
+                    n_early_detections += 1
+                    file_early_detections += 1
+                    lead_time = onset - det_time
+                    lead_times.append(lead_time)
+                    file_lead_times.append(lead_time)
+                    # La latencia clínica no puede ser negativa. El tiempo de
+                    # anticipación se reporta aparte como lead time.
+                    latency = 0.0
+                else:
+                    latency = det_time - onset
                 latencies.append(latency)
                 file_latencies.append(latency)
                 file_detected += 1
@@ -174,18 +227,22 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
             "n_files": 0,
             "n_seizures": 0,
             "n_detected": 0,
+            "n_early_detections": 0,
             "n_alarms": 0,
             "n_false_alarms": 0,
             "hours": 0.0,
             "latencies": [],
+            "lead_times": [],
         })
         patient_metrics["n_files"] += 1
         patient_metrics["n_seizures"] += len(seizures)
         patient_metrics["n_detected"] += file_detected
+        patient_metrics["n_early_detections"] += file_early_detections
         patient_metrics["n_alarms"] += len(file_alarms)
         patient_metrics["n_false_alarms"] += file_false_alarms
         patient_metrics["hours"] += _span_hours(int(local_ids[file_ids == fid].max()) + 1)
         patient_metrics["latencies"].extend(file_latencies)
+        patient_metrics["lead_times"].extend(file_lead_times)
 #por cada paciente calculo sensibilidad, falsas alarmas por hora y latencia media y mediana
     for patient_metrics in by_patient.values():
         patient_metrics["sensitivity"] = (
@@ -204,7 +261,16 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
             float(np.median(patient_metrics["latencies"]))
             if patient_metrics["latencies"] else 0.0
         )
+        patient_metrics["lead_time_mean"] = (
+            float(np.mean(patient_metrics["lead_times"]))
+            if patient_metrics["lead_times"] else 0.0
+        )
+        patient_metrics["lead_time_median"] = (
+            float(np.median(patient_metrics["lead_times"]))
+            if patient_metrics["lead_times"] else 0.0
+        )
         del patient_metrics["latencies"] #ya no me hace falta guardar esto
+        del patient_metrics["lead_times"]
 #falsas alarmas del split entero
     event_false_alarms_per_hour = n_false_alarms / total_hours if total_hours > 0 else 0.0
    #mediana de falsas alarmas por hora por paciente, para que un paciente ruidoso no domine la selección
@@ -226,6 +292,9 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         "latency_median": float(np.median(latencies)) if latencies else 0.0,
         "n_seizures": n_seizures,
         "n_detected": n_detected,
+        "n_early_detections": n_early_detections,
+        "lead_time_mean": float(np.mean(lead_times)) if lead_times else 0.0,
+        "lead_time_median": float(np.median(lead_times)) if lead_times else 0.0,
         "n_alarms": n_alarms,
         "n_false_alarms": n_false_alarms,
         "total_hours": total_hours,
@@ -236,6 +305,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
 def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                                  max_false_alarms_per_hour: float, n_within: int = 3, n_window: int = 4,
                                  min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                                 pre_onset_tolerance: float = EVENT_PRE_ONSET_TOLERANCE,
                                  thresholds=None) -> tuple[dict | None, float | None]:
     """
     Punto de operación a nivel EVENTO: entre los umbrales con mediana de falsas alarmas por hora por paciente NO supera `max_false_alarms_per_hour`, se elige el
@@ -255,7 +325,8 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
         ev = event_metrics(probs, labels, file_ids=file_ids, local_ids=local_ids,
                            valid_files=valid_files, annotations=annotations, threshold=t,
                            n_within=n_within, n_window=n_window,
-                           min_alarm_interval=min_alarm_interval, max_latency=max_latency)
+                           min_alarm_interval=min_alarm_interval, max_latency=max_latency,
+                           pre_onset_tolerance=pre_onset_tolerance)
         if ev["median_false_alarms_per_hour"] <= max_false_alarms_per_hour: #filtro por los thresholds que cumplen el techo de falsas alarmas por hora
            #voy definiendo cuál es mejor: el que tenga mayor sensibilidad, y si hay empate, el que tenga menor mediana de falsas alarmas por hora
             better = (best is None
@@ -267,4 +338,60 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
             if better:
                 best = ev
                 best_threshold = float(t)
+    return best, best_threshold
+
+
+def select_lowest_false_alarm_point(
+    probs,
+    labels,
+    *,
+    file_ids,
+    local_ids,
+    valid_files,
+    annotations,
+    n_within: int = 3,
+    n_window: int = 4,
+    min_alarm_interval: float = 30.0,
+    max_latency: float = 30.0,
+    pre_onset_tolerance: float = EVENT_PRE_ONSET_TOLERANCE,
+    thresholds=None,
+) -> tuple[dict, float]:
+    """Fallback cuando ningún umbral cumple el techo clínico.
+
+    No se presenta como un punto clínicamente factible: solo permite guardar un
+    checkpoint y evaluar test sin inventar un umbral fijo. La selección primaria
+    sigue marcando esta situación como fallback.
+    """
+    if thresholds is None:
+        thresholds = THRESHOLD_GRID
+    best = None
+    best_threshold = None
+    for t in thresholds:
+        ev = event_metrics(
+            probs,
+            labels,
+            file_ids=file_ids,
+            local_ids=local_ids,
+            valid_files=valid_files,
+            annotations=annotations,
+            threshold=t,
+            n_within=n_within,
+            n_window=n_window,
+            min_alarm_interval=min_alarm_interval,
+            max_latency=max_latency,
+            pre_onset_tolerance=pre_onset_tolerance,
+        )
+        better = (
+            best is None
+            or ev["median_false_alarms_per_hour"] < best["median_false_alarms_per_hour"]
+            or (
+                ev["median_false_alarms_per_hour"] == best["median_false_alarms_per_hour"]
+                and ev["sensibility"] > best["sensibility"]
+            )
+        )
+        if better:
+            best = ev
+            best_threshold = float(t)
+    if best is None or best_threshold is None:
+        raise RuntimeError("No se pudo evaluar ningún umbral de fallback.")
     return best, best_threshold

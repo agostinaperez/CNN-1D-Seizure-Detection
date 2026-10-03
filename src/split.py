@@ -24,17 +24,23 @@ from pathlib import Path
 from src.annotations import load_annotations, patient_seizure_stats
 from src.config import (
     DATASET_DIR,
+    FORCED_TEST_PATIENTS,
+    FORCED_TRAIN_PATIENTS,
     N_VAL_PATIENTS,
     PROCESSED_DIR,
     SPLIT_W_ZSEC,
     TEST_RATIO,
+    VAL_REQUIRED_PATIENTS,
 )
+from src.protocol import PROTOCOL_VERSION, split_id
 
 
 def split_dataset(
     stats: list[dict],
     test_ratio: float = TEST_RATIO,
     w_zsec: float = SPLIT_W_ZSEC,
+    forced_train_patients: list[str] | None = None,
+    forced_test_patients: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Ordena por severidad DESCENDENTE (más crisis primero)
@@ -53,6 +59,18 @@ def split_dataset(
     if w_zsec < 0:
         raise ValueError("w_zsec no puede ser negativo")
 
+    forced_train = list(FORCED_TRAIN_PATIENTS if forced_train_patients is None else forced_train_patients)
+    forced_test = list(FORCED_TEST_PATIENTS if forced_test_patients is None else forced_test_patients)
+    if len(forced_train) != len(set(forced_train)) or len(forced_test) != len(set(forced_test)):
+        raise ValueError("Las listas de pacientes forzados no pueden contener duplicados.")
+    known_patients = {s["patient"] for s in stats}
+    unknown = (set(forced_train) | set(forced_test)) - known_patients
+    if unknown:
+        raise ValueError(f"Pacientes forzados inexistentes en stats: {sorted(unknown)}")
+    overlap = set(forced_train) & set(forced_test)
+    if overlap:
+        raise ValueError(f"Pacientes forzados simultáneamente a train y test: {sorted(overlap)}")
+
     # 1) Orden de "severidad": pacientes con más crisis primero, así los
     #    "graves" no se van todos juntos para el mismo lado al final.
     ordered = sorted(stats, key=lambda s: (s["seizure_seconds"], s["n_files"]), reverse=True)
@@ -66,17 +84,19 @@ def split_dataset(
     target_train = 1.0 - test_ratio
 
     # Acumuladores: cuántos archivos / seg. de crisis ya repartí a train.
-    train_files = 0
-    train_zsec = 0.0
+    train_files = sum(s["n_files"] for s in ordered if s["patient"] in forced_train)
+    train_zsec = sum(s["seizure_seconds"] for s in ordered if s["patient"] in forced_train)
 
-    train_patients: list[str] = []
-    test_patients: list[str] = []
+    train_patients: list[str] = list(forced_train)
+    test_patients: list[str] = list(forced_test)
 
     # Reparto "codicioso": paciente por paciente, del más grave al más liviano.
     # Para cada paciente probamos LAS DOS OPCIONES (mandarlo a train o a test)
     # y elegimos la que deje el acumulado global MÁS cerquita del objetivo
     # (train = 70%). Así vamos "rellenando" el tren hasta llegar al 70%.
     for s in ordered:
+        if s["patient"] in forced_train or s["patient"] in forced_test:
+            continue
         f = s["n_files"]  # cuánto "volumen" aporta: archivos grabados (~1h c/u)
         zsec = s["seizure_seconds"]  # cuántos segundos de crisis le aporta
 
@@ -100,8 +120,6 @@ def split_dataset(
         # Elegimos la opción que menos se desvía (¿queda mejor en train o en test?).
         if dev_to_test < dev_to_train:
             test_patients.append(s["patient"])
-            test_files += f
-            test_zsec += zsec
         else:
             train_patients.append(s["patient"])
             train_files += f
@@ -110,27 +128,44 @@ def split_dataset(
     return train_patients, test_patients
 
 
-def pick_validation(train_patients: list[str], stats: list[dict], n_val: int = N_VAL_PATIENTS) -> list[str]:
+def pick_validation(
+    train_patients: list[str],
+    stats: list[dict],
+    n_val: int = N_VAL_PATIENTS,
+    required_patients: list[str] | None = None,
+) -> list[str]:
     """
     Elige N pacientes de validación DENTRO del conjunto de train.
 
     se toman pacientes "del medio" en severidad para que la validación tenga una mezcla típica
     de eventos. Si no alcanza el número pedido, se toma lo que haya.
     """
+    required = list(VAL_REQUIRED_PATIENTS if required_patients is None else required_patients)
+    if len(required) != len(set(required)):
+        raise ValueError("La lista de pacientes obligatorios de validación no puede contener duplicados.")
+    if len(required) > n_val:
+        raise ValueError("Hay más pacientes obligatorios de validación que plazas disponibles.")
+    missing = set(required) - set(train_patients)
+    if missing:
+        raise ValueError(f"Pacientes obligatorios de validación no están en train: {sorted(missing)}")
+
     # Mapa paciente -> severidad para ordenar.
     sev = {s["patient"]: s["seizure_seconds"] for s in stats}
 
     # Ordenar los train por severidad ascendente (menos crisis -> más crisis).
-    train_sorted = sorted(train_patients, key=lambda p: sev.get(p, 0))
+    train_sorted = sorted(
+        (p for p in train_patients if p not in set(required)),
+        key=lambda p: (sev.get(p, 0), p),
+    )
 
     # Elegimos posiciones "centrales" repartidas uniformemente a lo largo del orden, evitando extremos y sin repetición
-    assert len(train_sorted) > n_val, (
-        "Se necesitan más pacientes de train que " f"{n_val} para reservar validación."
-    )
-    idx = [(k * len(train_sorted)) // (n_val + 1) for k in range(1, n_val + 1)]
+    n_extra = n_val - len(required)
+    if len(train_sorted) < n_extra:
+        raise ValueError("No hay suficientes pacientes de train para reservar validación.")
+    idx = [(k * len(train_sorted)) // (n_extra + 1) for k in range(1, n_extra + 1)]
 
     # Tomamos las n_val posiciones centrales disponibles.
-    val = [train_sorted[i] for i in idx if i < len(train_sorted)]
+    val = required + [train_sorted[i] for i in idx if i < len(train_sorted)]
     return val[:n_val]
 
 
@@ -155,10 +190,19 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
         sys.exit("No hay pacientes con anotaciones")
 
     # Split determinista (w_zsec pesa más los segundos de crisis para equilibrar).
-    train, test = split_dataset(stats, TEST_RATIO, SPLIT_W_ZSEC)
+    # Los pacientes obligatorios de validación deben entrar primero al pool de
+    # desarrollo; luego `pick_validation` los reserva efectivamente para val.
+    forced_train_for_split = list(dict.fromkeys(FORCED_TRAIN_PATIENTS + VAL_REQUIRED_PATIENTS))
+    train, test = split_dataset(
+        stats,
+        TEST_RATIO,
+        SPLIT_W_ZSEC,
+        forced_train_patients=forced_train_for_split,
+        forced_test_patients=FORCED_TEST_PATIENTS,
+    )
 
     #Reservo validación desde train
-    val = pick_validation(train, stats, N_VAL_PATIENTS)
+    val = pick_validation(train, stats, N_VAL_PATIENTS, VAL_REQUIRED_PATIENTS)
 
     #Quitar los de validación de la lista de train "efectiva"
     train_eff = [p for p in train if p not in set(val)]
@@ -189,8 +233,14 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
     total_files = sum(s["n_files"] for s in stats)
     total_zsec = sum(s["seizure_seconds"] for s in stats)
     summary = {
+        "protocol_version": PROTOCOL_VERSION,
         "data_dir": str(data_dir),
         "test_ratio_solicitado": TEST_RATIO,
+        "n_val_patients_config": N_VAL_PATIENTS,
+        "val_required_patients": list(VAL_REQUIRED_PATIENTS),
+        "forced_train_patients": list(FORCED_TRAIN_PATIENTS),
+        "forced_test_patients": list(FORCED_TEST_PATIENTS),
+        "split_w_zsec": SPLIT_W_ZSEC,
         "n_train": len(train_eff),
         "n_val": len(val),
         "n_test": len(test),
@@ -211,6 +261,7 @@ def build_split(data_dir: Path | str = DATASET_DIR) -> dict:
             ),
         },
     }
+    summary["split_id"] = split_id(summary)
     return summary
 
 

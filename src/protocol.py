@@ -97,3 +97,28 @@ def compatibility_config(
         "threshold_grid": [float(t) for t in threshold_grid],
         "seed": int(seed),
     }
+
+
+def validate_checkpoint_scaler(checkpoint: dict, scaler_stats: dict) -> None:
+    """Valida el contrato de preprocesamiento de un checkpoint formato 4."""
+    required = ("scaler_id", "preprocessing_config")
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise RuntimeError("Checkpoint incompleto: faltan " + ", ".join(missing))
+
+    if not scaler_stats.get("split_id"):
+        raise RuntimeError("El scaler embebido no contiene split_id.")
+    if scaler_stats.get("scaler") != "robust":
+        raise RuntimeError("El checkpoint no contiene estadísticas de RobustScaler.")
+    if not scaler_stats.get("scaler_id"):
+        raise RuntimeError("El scaler embebido no contiene scaler_id.")
+    if scaler_stats.get("preprocessing_config") != preprocessing_config():
+        raise RuntimeError("El scaler embebido fue creado con otro preprocesamiento.")
+
+    computed_id = scaler_id(scaler_stats)
+    if scaler_stats["scaler_id"] != computed_id:
+        raise RuntimeError("Las estadísticas del scaler embebidas están corruptas.")
+    if checkpoint["scaler_id"] != computed_id:
+        raise RuntimeError("El checkpoint y las estadísticas del scaler no coinciden.")
+    if checkpoint["preprocessing_config"] != preprocessing_config():
+        raise RuntimeError("El checkpoint fue creado con otro preprocesamiento.")
