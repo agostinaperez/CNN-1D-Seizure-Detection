@@ -5,13 +5,13 @@ Métricas de evaluación para detección de crisis.
   - Nivel EVENTO (crisis): sensibilidad + tasa de falsas alarmas por hora + latencia, con postprocesado "n positivos en N ventanas consecutivas" + intervalo mínimo entre alarmas
 
 También expone:
-  - `select_operating_point`: el umbral con MENOR tasa de falsas alarmas por hora que cumpla sensibilidad >= objetivo
-    (lo que uso para elegir el mejor checkpoint en train)
+  - select_event_operating_point: el umbral con MAYOR sensibilidad de evento bajo el techo de falsas alarmas (lo uso en train para elegir checkpoint)
 """
 
 from __future__ import annotations
 
 import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
 from src.protocol import THRESHOLD_GRID
@@ -92,6 +92,75 @@ def binary_metrics(probs, labels, threshold: float, *, file_ids=None, local_ids=
         "false_negative": fn,
     }
 
+def rank_metrics(probs, labels) -> dict:
+    """
+    Calidad de RANKING del clasificador, independiente del umbral.
+
+      - AUC-ROC: probabilidad de ordenar una ventana positiva por encima de una negativa.
+      - AUPRC (average precision): área bajo la curva precisión-recall; es la métrica
+        de ranking recomendada bajo desbalance extremo (AUROC "premia" el desbalance).
+
+    Ambas miden si el modelo separa crisis de no-crisis más allá de qué umbral se elija.
+    """
+    probs = np.asarray(probs).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    if probs.shape != labels.shape or probs.size == 0:
+        raise ValueError("probs y labels deben ser no vacíos y de igual longitud")
+
+    n_pos = int((labels == 1).sum())
+    n_neg = int((labels == 0).sum())
+
+    auc_roc = None
+    if n_pos > 0 and n_neg > 0:
+        auc_roc = float(roc_auc_score(labels, probs)) #esto es de scikit-learn, los mismos del escalador robusto q uso en el preprocesado. Devuelve un float entre 0 y 1, donde 1 es perfecto y 0.5 es aleatorio
+
+    auprc = None
+    if n_pos > 0:
+        auprc = float(average_precision_score(labels, probs)) #tamb del scikit-learn, devuelve un float entre 0 y 1, donde 1 es perfecto y 0 es aleatorio
+
+    return {
+        "auc_roc": auc_roc,
+        "auprc": auprc,
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+    }
+
+
+def detect_event_intervals(window_starts, window_ends, predictions, *, min_alarm_interval: float = 30.0,) -> list[tuple[float, float]]:
+    """Agrupa ventanas positivas en episodios de crisis para inferencia.
+
+    start = inicio de la primera ventana positiva del episodio; end = fin de la última ventana positiva. Episodios separados por menos de `min_alarm_interval`
+    se fusionan en uno solo. Devuelve una lista de tuplas (start, end).
+    """
+    starts = np.asarray(window_starts, dtype=np.float64)
+    ends = np.asarray(window_ends, dtype=np.float64)
+    preds = np.asarray(predictions).reshape(-1).astype(bool)
+    if starts.shape != ends.shape or starts.shape != preds.shape:
+        raise ValueError("window_starts, window_ends y predictions deben tener igual longitud")
+    if min_alarm_interval < 0:
+        raise ValueError("min_alarm_interval no puede ser negativo")
+
+    events: list[tuple[float, float]] = []
+    event_start: float | None = None
+    event_end: float | None = None
+    #voy ventana por ventana, si la predicción es positiva, miro si estoy en un episodio o no. Si no estoy, inicio uno. Si estoy, miro si la ventana positiva está a menos de min_alarm_interval del final del episodio, si es así lo extiendo, sino cierro el episodio y abro uno nuevo
+    for i in range(len(preds)):
+        if not preds[i]:
+            continue
+        if event_start is None:
+            event_start = float(starts[i])
+            event_end = float(ends[i])
+        elif float(starts[i]) - event_end <= min_alarm_interval:
+            event_end = float(ends[i])
+        else:
+            events.append((event_start, event_end))
+            event_start = float(starts[i])
+            event_end = float(ends[i])
+    if event_start is not None and event_end is not None:
+        events.append((event_start, event_end))
+    return events
+
+
 def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotations,
                   threshold: float, n_within: int = 3, n_window: int = 4,
                   min_alarm_interval: float = 30.0, max_latency: float = 30.0) -> dict:
@@ -156,7 +225,7 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
             for k, t in enumerate(file_alarms):
                 if matched[k]: #si la alarma esta ya la use, la salteo
                     continue
-                if onset <= t <= onset + max_latency: #si la alarma cae dentro del rango de latencia permitido (o sea entre q arranca y los 30segs), la matcheo con la crisis
+                if onset <= t <= onset + max_latency:
                     matched[k] = True
                     det_time = t
                     break
@@ -267,4 +336,41 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
             if better:
                 best = ev
                 best_threshold = float(t)
+    return best, best_threshold
+
+
+def select_lowest_false_alarm_point(probs, labels, *, file_ids, local_ids, valid_files, annotations, n_within: int = 2,n_window: int = 3, min_alarm_interval: float = 30.0, max_latency: float = 30.0,  thresholds=None,) -> tuple[dict, float]:
+    """Fallback cuando ningún umbral cumple el techo clínico.
+    """
+    if thresholds is None:
+        thresholds = THRESHOLD_GRID
+    best = None
+    best_threshold = None
+    for t in thresholds:
+        ev = event_metrics(
+            probs,
+            labels,
+            file_ids=file_ids,
+            local_ids=local_ids,
+            valid_files=valid_files,
+            annotations=annotations,
+            threshold=t,
+            n_within=n_within,
+            n_window=n_window,
+            min_alarm_interval=min_alarm_interval,
+            max_latency=max_latency,
+        )
+        better = (
+            best is None
+            or ev["median_false_alarms_per_hour"] < best["median_false_alarms_per_hour"]
+            or (
+                ev["median_false_alarms_per_hour"] == best["median_false_alarms_per_hour"]
+                and ev["sensibility"] > best["sensibility"]
+            )
+        )
+        if better:
+            best = ev
+            best_threshold = float(t)
+    if best is None or best_threshold is None:
+        raise RuntimeError("No se pudo evaluar ningún umbral de fallback.")
     return best, best_threshold

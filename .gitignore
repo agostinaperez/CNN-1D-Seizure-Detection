@@ -4,3 +4,4 @@ teorico/
 __pycache__/
 models/
 results/
+inferences/

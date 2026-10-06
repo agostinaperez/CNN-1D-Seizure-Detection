@@ -34,11 +34,17 @@ from src.data import build_splits_dataloaders
 from src.metrics import (
     binary_metrics,
     event_metrics,
+    rank_metrics,
     select_event_operating_point,
+    select_lowest_false_alarm_point,
 )
 from src.model import SeizureCNN
 from src.train import evaluate, get_device
-from src.protocol import THRESHOLD_GRID, preprocessing_config, scaler_id, split_id
+from src.protocol import (
+    THRESHOLD_GRID,
+    split_id,
+    validate_checkpoint_scaler,
+)
 
 
 def load_checkpoint(path: Path) -> dict:
@@ -52,18 +58,13 @@ def load_checkpoint(path: Path) -> dict:
             "Regeneralo entrenando nuevamente con src.train."
         ) from exc
 
-    if checkpoint.get("format_version") != 3:
-        raise RuntimeError(
-            f"Formato de checkpoint no soportado: {checkpoint.get('format_version')!r}. "
-            "Regeneralo entrenando nuevamente con src.train."
-        )
-
+    # Normaliza las stats del scaler a NumPy (apply_scaler opera sobre NumPy)
     scaler_stats = checkpoint.get("scaler_stats")
     if scaler_stats is not None:
-        # apply_scaler opera sobre arrays NumPy; la serialización segura usa
-        # tensores para evitar objetos pickle, por eso se convierten aquí.
-        scaler_stats["median"] = scaler_stats["median"].numpy()
-        scaler_stats["iqr"] = scaler_stats["iqr"].numpy()
+        for key in ("median", "iqr"):
+            value = scaler_stats.get(key)
+            if torch.is_tensor(value):
+                scaler_stats[key] = value.numpy()
 
     return checkpoint
 
@@ -116,6 +117,9 @@ def main() -> None:
 
     # el event config guarda n_within y n_window (tiro alarma si en n_window ventanas hay n_within positivas), tamb guarda min alarm interval, max latency, y el techo de falsas alarmas
     event_config = checkpoint.get("event_config", {})
+    checkpoint_threshold_grid = [float(t) for t in checkpoint.get("threshold_grid", THRESHOLD_GRID)]
+    if not checkpoint_threshold_grid or any(not 0.0 <= t <= 1.0 for t in checkpoint_threshold_grid):
+        raise RuntimeError("threshold_grid inválida en el checkpoint.")
     
     max_false_alarms_per_hour = ( args.max_false_alarms_per_hour if args.max_false_alarms_per_hour is not None else event_config.get("max_false_alarms_per_hour", MAX_FALSE_ALARMS_PER_HOUR))
     positives_for_event = args.positives_for_event if args.positives_for_event is not None else event_config.get("n_within", POSITIVES_FOR_EVENT)
@@ -129,7 +133,11 @@ def main() -> None:
     if event_min_alarm_interval < 0 or event_max_latency < 0:
         raise ValueError("Los intervalos de evento no pueden ser negativos")
 
-    threshold = args.threshold if args.threshold is not None else checkpoint.get("op_threshold", checkpoint.get("threshold", THRESHOLD))
+    threshold = args.threshold if args.threshold is not None else checkpoint.get("op_threshold")
+    if threshold is None:
+        if args.split == "test":
+            raise RuntimeError("El checkpoint no contiene op_threshold seleccionado en validación.")
+        threshold = checkpoint.get("threshold", THRESHOLD)
 
     # Metadata del checkpoint 
     print("=" * 70)
@@ -147,7 +155,7 @@ def main() -> None:
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
     checkpoint_split_id = checkpoint.get("split_id")
     current_split_id = split_id(split)
-    if checkpoint_split_id and checkpoint_split_id != current_split_id:
+    if checkpoint_split_id != current_split_id:
         raise RuntimeError("El checkpoint y el split no coinciden: "
             f"checkpoint={checkpoint_split_id}, split={current_split_id}."
         )
@@ -155,13 +163,9 @@ def main() -> None:
     scaler_stats = checkpoint.get("scaler_stats")
     if scaler_stats is None:
         sys.exit("El checkpoint no contiene estadísticas del scaler.")
-    if scaler_stats.get("split_id") and scaler_stats["split_id"] != current_split_id:
+    validate_checkpoint_scaler(checkpoint, scaler_stats)
+    if scaler_stats["split_id"] != current_split_id:
         raise RuntimeError("El scaler embebido en el checkpoint no corresponde al split solicitado.")
-    if scaler_stats.get("scaler_id") and scaler_stats["scaler_id"] != scaler_id(scaler_stats):
-        raise RuntimeError("Las estadísticas del scaler embebidas están corruptas.")
-    saved_preprocessing = scaler_stats.get("preprocessing_config")
-    if saved_preprocessing and saved_preprocessing != preprocessing_config():
-        raise RuntimeError("El checkpoint fue creado con otro preprocesamiento.")
 
     # armo train/val/test. Para val/test recorre TODAS las ventanas en orden (sin undersampling, sin shuffle)
     # Construye datasets con el scaler embebido en el checkpoint.
@@ -182,9 +186,14 @@ def main() -> None:
     #Construyo el índice global ventana -> (archivo, ventana local) y el vector de label
     dataset._ensure_index()#pq hago esto acpa?
     m = binary_metrics(probs, labels, threshold, file_ids=dataset.file_ids, local_ids=dataset.local_ids,)
+    rk = rank_metrics(probs, labels)
 
     print("-" * 70)
     print(f"  Loss promedio ({args.split}):  {avg_loss:.6f}")
+    if rk["auc_roc"] is not None:
+        print(f"  AUC-ROC:                        {rk['auc_roc']:.4f}")
+    if rk["auprc"] is not None:
+        print(f"  AUPRC (average precision):      {rk['auprc']:.4f}")
     print(f"  [NIVEL VENTANA @ umbral {threshold:.2f}]")
     print(f"  Sensibilidad (recall):          {m['sensibility']:.4f}")
     print(f"  Especificidad:                  {m['specificity']:.4f}")
@@ -220,21 +229,24 @@ def main() -> None:
             n_within=positives_for_event, n_window=window_range_for_event,
             min_alarm_interval=event_min_alarm_interval,
             max_latency=event_max_latency,
+            thresholds=checkpoint_threshold_grid,
         )
 
     if ev is None:
-        # ningún umbral respeta el techo, recorro todos los umbrales y elijo el de menor mediana de falsas alarmas/h como para mostrarlo
-        for _t in THRESHOLD_GRID:
-            _e = event_metrics(probs, labels,
-                                file_ids=dataset.file_ids, local_ids=dataset.local_ids,
-                                valid_files=dataset.valid_files, annotations=dataset.annotations,
-                               threshold=_t,
-                                 n_within=positives_for_event, n_window=window_range_for_event,
-                                 min_alarm_interval=event_min_alarm_interval,
-                                 max_latency=event_max_latency)
-            if ev is None or _e["median_false_alarms_per_hour"] < ev["median_false_alarms_per_hour"]:
-                ev = _e
-                ev_threshold = float(_t)
+        # Ningún umbral respeta el techo; se muestra un fallback explícito.
+        ev, ev_threshold = select_lowest_false_alarm_point(
+            probs,
+            labels,
+            file_ids=dataset.file_ids,
+            local_ids=dataset.local_ids,
+            valid_files=dataset.valid_files,
+            annotations=dataset.annotations,
+            n_within=positives_for_event,
+            n_window=window_range_for_event,
+            min_alarm_interval=event_min_alarm_interval,
+            max_latency=event_max_latency,
+            thresholds=checkpoint_threshold_grid,
+        )
         print("\n  [NIVEL EVENTO]")
         print(f"  [WARN] Ningún umbral respetó el techo de {max_false_alarms_per_hour:.0f} falsas alarmas/h. "
               f"Mostrando el de menor mediana (umbral {ev_threshold:.2f}).")

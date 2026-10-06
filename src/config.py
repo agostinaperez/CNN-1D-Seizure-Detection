@@ -92,12 +92,6 @@ SPLIT_W_ZSEC = 2.0
 
 #learning rate inicial. Yo uso optimizador AdamW por ende el learning rate es de tasa adaptativa, el de cada peso se va recalculando y ajustando
 LEARNING_RATE = 1e-4
-# Clip de gradiente (saco la norma L2, sumando cada gradiente de la lista elevado al cuadrado, y sacando la raiz cuadrada del total): si la norma total es mayor a grad_clip, saco el factor
-#de escala -> factor = grad_clip / norma L2. A ese factor de escala lo multiplico x cada elemento de la lista de gradientes, para achicarlos proporcionalmente.
-#esto hace q no haga saltos como loco el gradiente y no se me desbalancee y me oscile tanto el modelo
-GRAD_CLIP = 1.0
-# learning rate mínimo del scheduler coseno (se alcanza al final del entrenamiento).
-LR_MIN = 0.0
 # Weight decay del AdamW: penaliza pesos grandes (regularización L2). En AdamW se aplica "desacoplado" del momento adaptativo (a diferencia del Adam clásico)
 # 1e-2 es el default de PyTorch; se puede bajar a 1e-4 si se nota underfitting.
 WEIGHT_DECAY = 1e-2
@@ -107,6 +101,14 @@ BATCH_SIZE = 64
 EPOCHS = 40
 # Early stopping: cortar si la pérdida de validación no mejora en 8 épocas.
 PATIENCE = 8
+
+# Función de pérdida de entrenamiento: "bce" (BCE con pos_weight) o "focal" (Focal Loss), que down-weightea los ejemplos fáciles
+# y enfoca el entrenamiento en los difíciles (crisis cortas y falsos positivos)
+LOSS = "bce"
+# Parámetros del Focal Loss. gamma=2 y alpha=0.25 son la configuración de referencia de Lin et al. (2017)
+# alpha es el factor  de la clase positiva: alpha=0.25 da peso 0.25 a crisis y 0.75 a no-crisis.
+FOCAL_GAMMA = 2.0
+FOCAL_ALPHA = 0.25
 
 # Ratios de negative:positive en cada batch de train.Ej: 4 => 4 ventanas no-crisis por cada ventana de crisis.
 NEG_POS_RATIO = 3
@@ -135,8 +137,7 @@ MAX_FALSE_ALARMS_PER_HOUR = 1.0
 POSITIVES_FOR_EVENT = 2
 WINDOW_RANGE_FOR_EVENT = 3
 # Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
-# 4 min (240 s): más conservador que 30 s, alinea el punto de operación con el
-# estándar clínico de la literatura (Wang TNSRE 2025 usa 20 min).
+# 4 min (240 s), alinea el punto de operación con e estándar clínico de la literatura, wang et al., (2025) usa 20 min
 EVENT_MIN_ALARM_INTERVAL = 240.0
 # Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].
 EVENT_MAX_LATENCY = 30.0
