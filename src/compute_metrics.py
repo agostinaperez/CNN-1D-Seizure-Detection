@@ -1,13 +1,7 @@
 """
 Métricas de cómputo del modelo (hardware-independientes y dependientes).
-
-Separa lo que no cambia según la máquina de lo que sí:
-
   - Independientes del hardware: nº de parámetros y FLOPs/MACs por ventana.
   - Dependientes del hardware: RAM/VRAM pico, latencia de inferencia por ventana.
-
-Se usan desde `train.py` para volcar un reporte de cómputo en el `.history.json`.
-Ver `PLAN_COMPUTO.md` para la justificación de cada métrica.
 """
 
 from __future__ import annotations
@@ -24,9 +18,12 @@ from src.config import FS, STRIDE_SAMPLES
 
 
 def count_parameters(model: nn.Module) -> dict:
-    """Parámetros totales, entrenables y desglose por bloque (conv/fc/otros)."""
+    """Parámetros totales, entrenables y desglose por bloque."""
+    #total es todos los pesos de cada capa, los sesgos de cada capa, y cualquier otro tensor registado como parametro
     total = sum(p.numel() for p in model.parameters())
+    #los mismos de arriba pero solo los que se van a actualizar en el entrenamiento. Algunos que no entran pueden ser los que se congelan para transfer learning o los que no tienen gradiente
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    #fc es fully connectes o sea de las capas densas
     by_block = {"conv": 0, "fc": 0, "other": 0}
     for module in model.modules():
         n = sum(p.numel() for p in module.parameters(recurse=False))
@@ -47,8 +44,10 @@ def count_parameters(model: nn.Module) -> dict:
 
 def measure_flops(model: nn.Module, input_shape: tuple[int, ...]) -> dict:
     """MACs y FLOPs de un forward para una muestra (batch=1) vía torchinfo.
-
-    FLOPs ≈ 2 × MACs (multiply-accumulate = 1 mult + 1 add).
+    Los MACs (multiply-accumulate) mide la cantidad de operaciones combinadas de multiplicación y suma (input.peso + bias) que hace el modelo. Representa la cantidad
+    de operaciones básicas q el modelo hace para procesar una entrada. La cantidad de MACs determina el uso de memoria de la red, porque están relacionadas directamente con el número de parámetros y activaciones en la misma
+    Los FLOPs son la cantidad total de operaciones matemáticas que necesita el modelo para procesar una entrada. Permite estimar el costo computacional de una red neuronal (a + FLOPs, tarda + tiempo entrenarla)
+    FLOPs ≈ 2 × MACs (1 MAC se compone de 1 mult + 1 suma).
     """
     info = summary(model, input_size=input_shape, verbose=0, depth=0)
     macs = float(info.total_mult_adds) if info.total_mult_adds is not None else 0.0
@@ -63,41 +62,38 @@ def peak_ram_mb() -> float:
     return psutil.Process().memory_info().rss / (1024.0 ** 2)
 
 
-def measure_inference_latency(
-    model: nn.Module,
-    sample_input: torch.Tensor,
-    device: str,
-    warmup: int = 10,
-    reps: int = 50,
-) -> dict:
-    """Latencia de inferencia por ventana (batch=1) y costo por hora de EEG.
-
-    Hace `warmup` forwards descartados (cold-start) y mide `reps` forwards,
-    reportando media y p95. Deriva los segundos que tarda en procesar una hora
-    de EEG (considerando el solapamiento del 50% entre ventanas).
+def measure_inference_latency(model: nn.Module, sample_input: torch.Tensor, device: str, warmup: int = 10, reps: int = 50, ) -> dict:
+    """latencia x inferencia (cuánto tarda el modelo en hacer una predicción) y costo por hora de EEG.
     """
     model.eval()
     x = sample_input.to(device)
     with torch.no_grad():
+        #corro una cantidad de forwards para que el modelo se "caliente" y no haya overhead de inicialización. A esas corridas las descarto
         for _ in range(warmup):
             _ = model(x)
+        #ahora sí corro el modelo y mido el tiempo con time.perf_counter() que es más preciso que time.time()
         per_rep_ms: list[float] = []
         for _ in range(reps):
             if device == "cuda":
+                #la gpu es asincrónica, entonces hay que sincronizarla antes de medir el tiempo para que no haya operaciones pendientes. torch.cuda.synchronize() bloquea el hilo hasta que todas las operaciones en la GPU hayan terminado
                 torch.cuda.synchronize()
+            #tiempo inicial
             t0 = time.perf_counter()
+            #Lo ejecuto
             _ = model(x)
             if device == "cuda":
+                #sincronizo y guardo el tiempo final q tardó
                 torch.cuda.synchronize()
-            per_rep_ms.append((time.perf_counter() - t0) * 1000.0)
+            per_rep_ms.append((time.perf_counter() - t0) * 1000.0) #en milisegundos (ms)
 
-    ms_mean = float(np.mean(per_rep_ms))
-    ms_p95 = float(np.percentile(per_rep_ms, 95))
+    ms_mean = float(np.mean(per_rep_ms)) #promedio de cuanto tarda una ventana
+    ms_p95 = float(np.percentile(per_rep_ms, 95)) #percentil 95 de cuanto tarda
 
-    # Ventanas por hora de EEG: cada ventana nueva avanza STRIDE_SAMPLES muestras.
-    windows_per_hour = (3600.0 * FS) / STRIDE_SAMPLES
-    seconds_per_hour = ms_mean * windows_per_hour / 1000.0
-
+    # Ventanas por hora de EEG. Stride samples es cuanto avanza cada ventana nueva. Al tener 50% de solapamiento, cada ventana avanza solo la mitad de su largo
+    windows_per_hour = (3600.0 * FS) / STRIDE_SAMPLES #cuantas ventanas hay en 1 hs de señal
+    seconds_per_hour = ms_mean * windows_per_hour / 1000.0 #cuántos segundos de cómputo me lleva procesar 1 hs (onda cuan rápido em responde el modelo YA ENTRENADO)
+    # Si es < 3600 el modelo puede procesar en tiempo real (procesa más rápido de lo que llega la señal)
+    # Si es > 3600, es más lento que el tiempo real
     return {
         "ms_per_window_mean": ms_mean,
         "ms_per_window_p95": ms_p95,

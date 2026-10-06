@@ -102,15 +102,11 @@ EPOCHS = 40
 # Early stopping: cortar si la pérdida de validación no mejora en 8 épocas.
 PATIENCE = 8
 
-# Función de pérdida de entrenamiento: "bce" (BCE con pos_weight, baseline) o
-# "focal" (Focal Loss, Lin et al. 2017), que down-weightea los ejemplos fáciles
+# Función de pérdida de entrenamiento: "bce" (BCE con pos_weight) o "focal" (Focal Loss), que down-weightea los ejemplos fáciles
 # y enfoca el entrenamiento en los difíciles (crisis cortas y falsos positivos)
-# bajo el desbalance extremo del EEG (~0.5% de ventanas de crisis).
 LOSS = "bce"
-# Parámetros del Focal Loss. gamma=2 y alpha=0.25 son la configuración de
-# referencia de Lin et al. (2017). En esta implementación alpha es el factor
-# de la clase positiva: alpha=0.25 da peso 0.25 a crisis y 0.75 a no-crisis.
-# No se combina con pos_weight; el efecto del desbalance se evalúa en validación.
+# Parámetros del Focal Loss. gamma=2 y alpha=0.25 son la configuración de referencia de Lin et al. (2017)
+# alpha es el factor  de la clase positiva: alpha=0.25 da peso 0.25 a crisis y 0.75 a no-crisis.
 FOCAL_GAMMA = 2.0
 FOCAL_ALPHA = 0.25
 
@@ -141,15 +137,10 @@ MAX_FALSE_ALARMS_PER_HOUR = 1.0
 POSITIVES_FOR_EVENT = 2
 WINDOW_RANGE_FOR_EVENT = 3
 # Intervalo mínimo entre dos alarmas, para no contar la misma crisis dos veces.
-# 4 min (240 s): más conservador que 30 s, alinea el punto de operación con el
-# estándar clínico de la literatura (Wang TNSRE 2025 usa 20 min).
+# 4 min (240 s), alinea el punto de operación con e estándar clínico de la literatura, wang et al., (2025) usa 20 min
 EVENT_MIN_ALARM_INTERVAL = 240.0
 # Una crisis cuenta como DETECTADA si hay una alarma dentro de [onset, onset + MAX_LATENCY].
 EVENT_MAX_LATENCY = 30.0
-# Política estricta por defecto: las alarmas anteriores al onset se reportan como
-# falsas. Si el protocolo clínico acepta alertas tempranas, este valor permite
-# contar una alarma dentro de [onset - tolerancia, onset + EVENT_MAX_LATENCY].
-EVENT_PRE_ONSET_TOLERANCE = 0.0
 #--------------------------------------------------------------------------------------------------------------------
 # Workers del DataLoader (0 = proceso único)
 NUM_WORKERS = 0
