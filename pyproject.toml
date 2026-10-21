@@ -1,0 +1,33 @@
+[project]
+name = "deteccion-crisis-eeg-cnn1d"
+version = "0.1.0"
+description = "Detección automática de eventos epilépticos en señales EEG mediante una CNN-1D."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jupyter>=1.0.0",
+    "ipykernel>=6.22.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    "matplotlib>=3.7.0",
+    "mne>=1.13.0",
+    "numpy>=2.0.0",
+    "psutil>=7.0.0",
+    "scipy>=1.14.0",
+    "scikit-learn>=1.6.0",
+    "torch>=2.6.0",
+    "torchinfo>=1.8.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]

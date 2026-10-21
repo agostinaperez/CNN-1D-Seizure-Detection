@@ -6,6 +6,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Rutas del proyecto
 
 # Directorio raíz: ia-final/
@@ -17,8 +21,15 @@ MODELS_DIR = BASE_DIR / "models"
 # Ubicación de las anotaciones procesadas del split.
 SPLIT_FILE = PROCESSED_DIR / "split.json"
 
-# Dataset CHB-MIT: se setea por argumento en cada script; este es el default local. En Google Colab se pasa con --data-dir la ruta de Google Drive.
-DATASET_DIR = Path(os.environ.get("CHBMIT_DIR", r"C:/Users/Usuario/tesis/physionet.org/files/chbmit/1.0.0",))
+# Dataset CHB-MIT: se setea por argumento en cada script (--data-dir) o con la
+# variable de entorno CHBMIT_DIR (en `.env`). Si falta, se aborta con un mensaje claro.
+_chbmit_dir = os.environ.get("CHBMIT_DIR")
+if not _chbmit_dir:
+    raise RuntimeError(
+        "CHBMIT_DIR no definido. Copiá `.env.example` a `.env` y setea la ruta local "
+        "al dataset CHB-MIT descargado de PhysioNet, o pasá `--data-dir` al script."
+    )
+DATASET_DIR = Path(_chbmit_dir)
 
 # Stats del estandarizador por canal
 SCALER_STATS_FILE = PROCESSED_DIR / "scaler_stats.npz"

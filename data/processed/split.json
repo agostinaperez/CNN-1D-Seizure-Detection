@@ -1,0 +1,264 @@
+{
+  "protocol_version": 1,
+  "data_dir": "C:\\Users\\Usuario\\tesis\\physionet.org\\files\\chbmit\\1.0.0",
+  "test_ratio_solicitado": 0.21,
+  "n_val_patients_config": 5,
+  "val_required_patients": [
+    "chb14"
+  ],
+  "forced_train_patients": [
+    "chb06"
+  ],
+  "forced_test_patients": [
+    "chb16"
+  ],
+  "split_w_zsec": 2.0,
+  "n_train": 13,
+  "n_val": 5,
+  "n_test": 6,
+  "train": [
+    "chb06",
+    "chb15",
+    "chb12",
+    "chb08",
+    "chb05",
+    "chb13",
+    "chb10",
+    "chb01",
+    "chb23",
+    "chb04",
+    "chb19",
+    "chb21",
+    "chb02"
+  ],
+  "val": [
+    "chb14",
+    "chb22",
+    "chb03",
+    "chb24",
+    "chb11"
+  ],
+  "test": [
+    "chb16",
+    "chb07",
+    "chb18",
+    "chb20",
+    "chb17",
+    "chb09"
+  ],
+  "patients": {
+    "chb01": {
+      "patient": "chb01",
+      "n_files": 42,
+      "n_seizures": 7,
+      "seizure_seconds": 442,
+      "mean_seizure_seconds": 63.142857142857146,
+      "split": "train"
+    },
+    "chb02": {
+      "patient": "chb02",
+      "n_files": 36,
+      "n_seizures": 3,
+      "seizure_seconds": 172,
+      "mean_seizure_seconds": 57.333333333333336,
+      "split": "train"
+    },
+    "chb03": {
+      "patient": "chb03",
+      "n_files": 38,
+      "n_seizures": 7,
+      "seizure_seconds": 402,
+      "mean_seizure_seconds": 57.42857142857143,
+      "split": "val"
+    },
+    "chb04": {
+      "patient": "chb04",
+      "n_files": 42,
+      "n_seizures": 4,
+      "seizure_seconds": 378,
+      "mean_seizure_seconds": 94.5,
+      "split": "train"
+    },
+    "chb05": {
+      "patient": "chb05",
+      "n_files": 39,
+      "n_seizures": 5,
+      "seizure_seconds": 558,
+      "mean_seizure_seconds": 111.6,
+      "split": "train"
+    },
+    "chb06": {
+      "patient": "chb06",
+      "n_files": 18,
+      "n_seizures": 10,
+      "seizure_seconds": 153,
+      "mean_seizure_seconds": 15.3,
+      "split": "train"
+    },
+    "chb07": {
+      "patient": "chb07",
+      "n_files": 19,
+      "n_seizures": 3,
+      "seizure_seconds": 325,
+      "mean_seizure_seconds": 108.33333333333333,
+      "split": "test"
+    },
+    "chb08": {
+      "patient": "chb08",
+      "n_files": 20,
+      "n_seizures": 5,
+      "seizure_seconds": 919,
+      "mean_seizure_seconds": 183.8,
+      "split": "train"
+    },
+    "chb09": {
+      "patient": "chb09",
+      "n_files": 19,
+      "n_seizures": 4,
+      "seizure_seconds": 276,
+      "mean_seizure_seconds": 69.0,
+      "split": "test"
+    },
+    "chb10": {
+      "patient": "chb10",
+      "n_files": 25,
+      "n_seizures": 7,
+      "seizure_seconds": 447,
+      "mean_seizure_seconds": 63.857142857142854,
+      "split": "train"
+    },
+    "chb11": {
+      "patient": "chb11",
+      "n_files": 35,
+      "n_seizures": 3,
+      "seizure_seconds": 806,
+      "mean_seizure_seconds": 268.6666666666667,
+      "split": "val"
+    },
+    "chb12": {
+      "patient": "chb12",
+      "n_files": 24,
+      "n_seizures": 40,
+      "seizure_seconds": 1475,
+      "mean_seizure_seconds": 36.875,
+      "split": "train"
+    },
+    "chb13": {
+      "patient": "chb13",
+      "n_files": 33,
+      "n_seizures": 12,
+      "seizure_seconds": 535,
+      "mean_seizure_seconds": 44.583333333333336,
+      "split": "train"
+    },
+    "chb14": {
+      "patient": "chb14",
+      "n_files": 26,
+      "n_seizures": 8,
+      "seizure_seconds": 169,
+      "mean_seizure_seconds": 21.125,
+      "split": "val"
+    },
+    "chb15": {
+      "patient": "chb15",
+      "n_files": 40,
+      "n_seizures": 20,
+      "seizure_seconds": 1992,
+      "mean_seizure_seconds": 99.6,
+      "split": "train"
+    },
+    "chb16": {
+      "patient": "chb16",
+      "n_files": 19,
+      "n_seizures": 10,
+      "seizure_seconds": 84,
+      "mean_seizure_seconds": 8.4,
+      "split": "test"
+    },
+    "chb17": {
+      "patient": "chb17",
+      "n_files": 21,
+      "n_seizures": 3,
+      "seizure_seconds": 293,
+      "mean_seizure_seconds": 97.66666666666667,
+      "split": "test"
+    },
+    "chb18": {
+      "patient": "chb18",
+      "n_files": 36,
+      "n_seizures": 6,
+      "seizure_seconds": 317,
+      "mean_seizure_seconds": 52.833333333333336,
+      "split": "test"
+    },
+    "chb19": {
+      "patient": "chb19",
+      "n_files": 30,
+      "n_seizures": 3,
+      "seizure_seconds": 236,
+      "mean_seizure_seconds": 78.66666666666667,
+      "split": "train"
+    },
+    "chb20": {
+      "patient": "chb20",
+      "n_files": 29,
+      "n_seizures": 8,
+      "seizure_seconds": 294,
+      "mean_seizure_seconds": 36.75,
+      "split": "test"
+    },
+    "chb21": {
+      "patient": "chb21",
+      "n_files": 33,
+      "n_seizures": 4,
+      "seizure_seconds": 199,
+      "mean_seizure_seconds": 49.75,
+      "split": "train"
+    },
+    "chb22": {
+      "patient": "chb22",
+      "n_files": 31,
+      "n_seizures": 3,
+      "seizure_seconds": 204,
+      "mean_seizure_seconds": 68.0,
+      "split": "val"
+    },
+    "chb23": {
+      "patient": "chb23",
+      "n_files": 9,
+      "n_seizures": 7,
+      "seizure_seconds": 424,
+      "mean_seizure_seconds": 60.57142857142857,
+      "split": "train"
+    },
+    "chb24": {
+      "patient": "chb24",
+      "n_files": 12,
+      "n_seizures": 16,
+      "seizure_seconds": 511,
+      "mean_seizure_seconds": 31.9375,
+      "split": "val"
+    }
+  },
+  "volumen": {
+    "train": {
+      "files": 391,
+      "seizure_seconds": 7930
+    },
+    "val": {
+      "files": 142,
+      "seizure_seconds": 2092
+    },
+    "test": {
+      "files": 143,
+      "seizure_seconds": 1589
+    },
+    "total": {
+      "files": 676,
+      "seizure_seconds": 11611
+    },
+    "frac_test_files": 0.2115,
+    "frac_test_seizure_seconds": 0.1369
+  },
+  "split_id": "97b85b489c3e9cbc"
+}

@@ -1,7 +1,52 @@
-notebooks/
-data/
-teorico/
+# Python
 __pycache__/
-models/
-results/
-inferences/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Datos crudos (pesados/privados): CHB-MIT (~64 GB) NO se versiona.
+# Se descarga de PhysioNet (ver README, sección "El dataset").
+data/raw/*
+!data/raw/.gitkeep
+
+# Modelos entrenados (checkpoints .pt): no versionar los pesos.
+models/**/*.pt
+models/*/*.json
+models/*.json
+models/**/*.pkl
+models/**/*.h5
+
+# Historiales de entrenamiento (métricas/curvas por checkpoint)
+*.history.json
+
+# Variables de entorno / credenciales — NUNCA subir esto
+.env
+*.env.local
+
+# Logs y temporales
+*.log
+*.tmp

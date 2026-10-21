@@ -1,0 +1,102 @@
+======================================================================
+EVALUACIÓN DE CHECKPOINT
+======================================================================
+  Checkpoint:      alpha025.pt
+  Época guardada:  17
+  best_val_loss:   0.018837
+  pos_weight:      3.0
+  seed:            42
+  threshold:       0.7
+  split a evaluar: test
+  Ventanas test: 334946  (692 positivas, 334254 negativas)
+----------------------------------------------------------------------
+  Loss promedio (test):  0.151361
+  AUC-ROC:                        0.8957
+  AUPRC (average precision):      0.3881
+  [NIVEL VENTANA @ umbral 0.70]
+  Sensibilidad (recall):          0.6358
+  Especificidad:                  0.9722
+  FPR (tasa falsos positivos):    0.0278
+  Falsos positivos por hora:      38.9873
+  Accuracy:                       0.9715
+  F1:                             0.0845
+  MCC:                            0.1644
+  Conteos -> TP=440  FP=9285  TN=324969  FN=252
+
+  [NIVEL EVENTO]
+  Sensibilidad:              0.6765  (23/34 crisis detectadas)
+  Falsas alarmas de evento/h: 3.0484  (mediana por paciente: 2.4186)  (726 falsas alarmas en 238.2 h cubiertas)
+  Latencia media:            15.85 s
+  Latencia mediana:          18.58 s
+  Postprocesado:             >= 2 positivos en 3 ventanas consecutivas
+  Desglose por paciente:
+    chb07: sens=0.6667 (2/3), falsas alarmas/h=3.2662
+    chb09: sens=0.7500 (3/4), falsas alarmas/h=5.6287
+    chb16: sens=0.2000 (2/10), falsas alarmas/h=4.2106
+    chb17: sens=1.0000 (3/3), falsas alarmas/h=1.5710
+    chb18: sens=0.8333 (5/6), falsas alarmas/h=0.2245
+    chb20: sens=1.0000 (8/8), falsas alarmas/h=0.1449
+======================================================================
+
+
+
+======================================================================
+EVALUACIÓN DE CHECKPOINT
+======================================================================
+  Checkpoint:      bce.pt
+  Época guardada:  17
+  best_val_loss:   0.017759
+  pos_weight:      3.0
+  seed:            42
+  threshold:       0.9
+  split a evaluar: test
+  Ventanas test: 334946  (692 positivas, 334254 negativas)
+----------------------------------------------------------------------
+  Loss promedio (test):  0.272629
+  [RANKING (independiente del umbral)]
+  AUC-ROC:                        0.8915
+  AUPRC (average precision):      0.3736
+  [NIVEL VENTANA @ umbral 0.90]
+  Sensibilidad (recall):          0.6734
+  Especificidad:                  0.9567
+  FPR (tasa falsos positivos):    0.0433
+  Falsos positivos por hora:      60.7379
+  Accuracy:                       0.9561
+  F1:                             0.0597
+  MCC:                            0.1386
+  Conteos -> TP=466  FP=14465  TN=319789  FN=226
+
+  [NIVEL EVENTO]
+  Métricas sobre test usando threshold fijado en validación: 0.90
+  Threshold aplicado: 0.90
+  Sensibilidad:              0.6471  (22/34 crisis detectadas)
+  Falsas alarmas de evento/h: 3.3928  (mediana por paciente: 2.0475)  (808 falsas alarmas en 238.2 h cubiertas)
+  Latencia media:            16.70 s
+  Latencia mediana:          17.32 s
+  Detecciones pre-onset:     0  (lead time mediano: 0.00 s)
+  Tolerancia pre-onset:      0.00 s
+  Postprocesado:             >= 2 positivos en 3 ventanas consecutivas
+  Desglose por paciente:
+    chb07: sens=0.6667 (2/3), falsas alarmas/h=2.7144
+    chb09: sens=0.5000 (2/4), falsas alarmas/h=7.7063
+    chb16: sens=0.2000 (2/10), falsas alarmas/h=2.9474
+    chb17: sens=1.0000 (3/3), falsas alarmas/h=1.3806
+    chb18: sens=0.8333 (5/6), falsas alarmas/h=0.3087
+    chb20: sens=1.0000 (8/8), falsas alarmas/h=0.2536
+======================================================================
+
+Focal alpha=.25 es mejor en ranking y en la mayoría de las métricas de ventana:
+- AUPRC sube de 0.3736 a 0.3881.
+- Hay 5180 falsos positivos menos.
+- El FPR baja aproximadamente un 36%.
+- MCC y F1 mejoran.
+- Detecta una crisis más a nivel evento: 23/34 contra 22/34.
+Eso es evidencia favorable para Focal Loss.
+Pero no es una victoria clínica completa:
+- Ambos fallan el objetivo de sensibilidad >=90%.
+- Ambos superan ampliamente el límite de 1 falsa alarma/h.
+- BCE tiene mejor mediana de falsas alarmas por paciente.
+- chb16 sigue en 2/10 para ambos modelos; Focal no resolvió las crisis cortas difíciles.
+- La mejora de sensibilidad evento es solamente una crisis, por lo que con 34 crisis todavía hay bastante incertidumbre.
+
+Focal Loss mejoró modestamente la discriminación y redujo los falsos positivos respecto de BCE, aunque el modelo todavía no alcanza los objetivos clínicos de sensibilidad y falsas alarmas por hora
