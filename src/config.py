@@ -22,14 +22,12 @@ MODELS_DIR = BASE_DIR / "models"
 SPLIT_FILE = PROCESSED_DIR / "split.json"
 
 # Dataset CHB-MIT: se setea por argumento en cada script (--data-dir) o con la
-# variable de entorno CHBMIT_DIR (en `.env`). Si falta, se aborta con un mensaje claro.
+# variable de entorno CHBMIT_DIR (en `.env`). Solo hace falta para entrenar,
+# computar stats o evaluar; la inferencia sobre un EDF suelto usa las stats
+# embebidas en el checkpoint. Por eso permitimos importar config sin CHBMIT_DIR
+# (lo necesita la demo web), dejando DATASET_DIR en None en ese caso.
 _chbmit_dir = os.environ.get("CHBMIT_DIR")
-if not _chbmit_dir:
-    raise RuntimeError(
-        "CHBMIT_DIR no definido. Copiá `.env.example` a `.env` y setea la ruta local "
-        "al dataset CHB-MIT descargado de PhysioNet, o pasá `--data-dir` al script."
-    )
-DATASET_DIR = Path(_chbmit_dir)
+DATASET_DIR = Path(_chbmit_dir) if _chbmit_dir else None
 
 # Stats del estandarizador por canal
 SCALER_STATS_FILE = PROCESSED_DIR / "scaler_stats.npz"

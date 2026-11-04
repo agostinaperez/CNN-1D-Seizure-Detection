@@ -34,14 +34,12 @@ data/raw/*
 !data/raw/.gitkeep
 
 # Modelos entrenados (checkpoints .pt): no versionar los pesos.
-models/**/*.pt
-models/*/*.json
-models/*.json
-models/**/*.pkl
-models/**/*.h5
-
+# El checkpoint final se publica como Release (ver README, sección "Instalación").
+models/*.pt
+models/unused/
 # Historiales de entrenamiento (métricas/curvas por checkpoint)
 *.history.json
+*.docx
 
 # Variables de entorno / credenciales — NUNCA subir esto
 .env
