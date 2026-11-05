@@ -16,7 +16,7 @@ Inspeccionar visualmente un registro de electroencefalograma (EEG) es una tarea 
 
 El enfoque elegido es una red neuronal convolucional 1D (CNN-1D) que opera directamente sobre la señal cruda filtrada, sin necesidad de transformaciones manuales a otros dominios. El sistema se entrena con aprendizaje supervisado y evalúa su desempeño con métricas clínicas de detección de crisis (sensibilidad, falsas alarmas por hora y latencia de detección), no solo con accuracy.
 
-El resultado principal: la CNN-1D alcanza una sensibilidad de crisis del 67,6 % (23 de 34 crisis detectadas) sobre pacientes no vistos, con un AUPRC de 0,39, superando de forma consistente al baseline (un clasificador que siempre predice "no crisis"). El modelo es un primer MVP de apoyo a la decisión, todavía por debajo de los objetivos clínicos de sensibilidad y de tasa de falsas alarmas.
+El resultado principal es que la CNN-1D alcanza una sensibilidad de crisis del 67,6 % (23 de 34 crisis detectadas) sobre pacientes no vistos, con un AUPRC de 0,39, superando de forma consistente a los baselines clásicos (el clasificador mayoritario y modelos de machine learning sobre potencia por banda). El modelo es un primer MVP de apoyo a la decisión, todavía por debajo de los objetivos clínicos de sensibilidad y de tasa de falsas alarmas.
 
 ### Contexto académico
 
@@ -88,20 +88,22 @@ Validación: split inter-paciente fijo (train/val/test, sin mezclar ventanas del
 
 ## Resultados
 
-Métricas sobre el test congelado inter-paciente (6 pacientes, 34 crisis). El baseline es el clasificador conservador que predice siempre la clase mayoritaria ("no crisis").
+Métricas sobre el test congelado inter-paciente (6 pacientes, 34 crisis). Los baselines de comparación son dos modelos de machine learning sobre features
+de ingeniería (potencia espectral de cada ventana en las bandas canónicas del EEG), entrenados como regresión logística y SVM lineal. Se usa el mismo split inter-paciente, el mismo postprocesado de evento y el mismo criterio de punto de operación que la CNN. 
 
-| Métrica | Baseline (mayoritaria) | BCE | Focal α=.25 (final) |
-|---|---|---|---|
-| AUC-ROC | 0,50 | 0,8915 | 0,8957 |
-| AUPRC | ≈ 0,002 | 0,3736 | 0,3881 |
-| Sensibilidad de crisis (evento) | 0 % | 64,7 % (22/34) | 67,6 % (23/34) |
-| Falsas alarmas/h (mediana por paciente) | 0 | 2,05 | 2,42 |
-| Sensibilidad (ventana) | 0 % | 67,3 % | 63,6 % |
-| Especificidad (ventana) | 100 % | 95,7 % | 97,2 % |
-| MCC (ventana) | 0 | 0,139 | 0,164 |
-| Latencia media de detección | — | 16,70 s | 15,85 s |
+| Métrica  | Regresión logística |SVM lineal | BCE | Focal α=.25 (final) |
+|----------|---------------------|-----------|-----|---------------------|
+| AUC-ROC | 0,694 | 0,710 | 0,8915 | 0,8957 |
+| AUPRC   | 0,030 | 0,064 |0,3736 | 0,3881 |
+| Sensibilidad de crisis (evento) | 26,5 % (9/34) | 17,6% (6/34) | 64,7 % (22/34) | 67,6 % (23/34) |
+| Falsas alarmas/h (mediana por paciente) | 12,55 | 0,41 | 2,05 | 2,42 |
+| Sensibilidad (ventana)                  | 0,593 | 0,189 | 67,3 % | 63,6 % |
+| Especificidad (ventana)                 | 69,6% | 99,6% | 95,7 % | 97,2 % |
+| MCC (ventana)                           | - | - | 0,139 | 0,164 |
+| Latencia media de detección | 14,9s | 17,6s |16,70 s | 15,85 s |
 
 Focal α=.25 es superior a BCE en ranking (AUPRC y AUC) y en la mayoría de las métricas de ventana: reduce los falsos positivos (~36 % menos de FPR) y mejora MCC y F1.
+En comparación con los baselines, la CNN supera ampliamente a ambos: mejora el AUC-ROC de ~0,71 a 0,90, multiplica el AUPRC por más de 6 (0,39 vs 0,06), detecta más del doble de crisis (23/34 vs 9/34 y 6/34). El SVM lineal logra respetar el techo clínico de falsas alarmas (0,41/h) pero a costa de una sensibilidad muy baja (17,6 %).
 
 ### Análisis crítico
 
@@ -127,7 +129,8 @@ El modelo es un MVP funcional que supera al baseline, pero no alcanza todavía l
 ├── PLAN_CV.md             # plan de validación cruzada (próximo paso)
 ├── INFORME_TECNICO.pdf    # informe técnico del trabajo
 ├── src/                   # código fuente (funciones y módulos propios)
-│   └── api.py             # API FastAPI + demo de inferencia
+│   ├── api.py             # API FastAPI + demo de inferencia
+│   └── baseline.py        # baselines clásicos (potencia por banda: LR y SVM lineal)
 ├── frontend/              # interfaz web de la demo (Vue 3 + ECharts)
 ├── data/
 │   ├── raw/               # CHB-MIT crudo (~64 GB, NO versionado)
@@ -199,6 +202,9 @@ python -m src.train --data-dir <ruta/chbmit/1.0.0> --out models/focal.pt --loss 
 
 # Evaluar el checkpoint elegido sobre test
 python -m src.evaluate --checkpoint models/focal.pt --split test --data-dir <ruta/chbmit/1.0.0>
+
+# Baselines clásicos (regresión logística / SVM lineal sobre potencia por banda)
+python -m src.baseline --data-dir <ruta/chbmit/1.0.0> --model all
 ```
 
 La inferencia procesa un EDF pregrabado completo y reporta, por ventana, si detecta crisis; el informe detallado se guarda en `inferences/`.
@@ -235,8 +241,6 @@ Tests de unidad que no requieren el dataset (preprocesamiento, métricas, modelo
 pip install -e ".[dev]"
 python -m pytest -q
 ```
-
----
 
 ## Autora
 

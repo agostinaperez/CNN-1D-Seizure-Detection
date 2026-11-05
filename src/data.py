@@ -229,6 +229,12 @@ class WindowDataset(Dataset):
         return self._local_ids
 
     @property
+    def labels(self) -> np.ndarray:
+        self._ensure_index()
+        assert self._labels is not None
+        return self._labels
+
+    @property
     def valid_files(self) -> list[Path]:
         self._ensure_index()
         return self._valid_files
