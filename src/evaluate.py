@@ -55,7 +55,7 @@ def load_checkpoint(path: Path) -> dict:
     except Exception as exc:
         raise RuntimeError(
             f"El checkpoint '{path}' no tiene el formato seguro esperado. "
-            "Regeneralo entrenando nuevamente con src.train."
+            "Regeneralo ejecutando el flujo de validación cruzada con src.cv."
         ) from exc
 
     # Normaliza las stats del scaler a NumPy (apply_scaler opera sobre NumPy)
@@ -86,11 +86,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--threshold", type=float, default=None, help="Umbral de decisión. Por defecto usa el que guardó el checkpoint.")
-    parser.add_argument("--max-false-alarms-per-hour", type=float, default=None, help="Techo clínico de falsas alarmas de evento por hora: entre los umbrales que lo respetan se elige el de mayor sensibilidad de crisis.")
-    parser.add_argument("--positives-for-event", type=int, default=None, help="Alarma si hay >= N positivos dentro de las últimas N_WINDOW ventanas (nivel evento).")
-    parser.add_argument("--window-range-for-event", type=int, default=None, help="Cantidad de ventanas consecutivas consideradas para la regla de evento (nivel evento).")
-    parser.add_argument("--event-min-alarm-interval", type=float, default=None, help="Segundos mínimos entre dos alarmas (nivel evento).")
-    parser.add_argument("--event-max-latency", type=float, default=None, help="Ventana de latencia [onset, onset+max] para dar una crisis por detectada.")
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs del split (smoke-test rápido).")
     args = parser.parse_args()
@@ -105,11 +100,15 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
-    device = get_device(args.device)
+def evaluate_checkpoint_on_split(checkpoint_path: Path | str, *, data_dir: Path | str, split: dict, split_name: str = "val",
+    device: str | None = None, batch_size: int = BATCH_SIZE, num_workers: int = NUM_WORKERS, threshold: float | None = None, limit_files: int | None = None,
+    reselect_operating_point: bool = True,) -> dict:
+    """Mide un checkpoint sobre un split dado, reutilizando el scaler embebido.
+    Devuelve un dict con ranking, ventana y evento + la metadata del checkpoint.
+    """
+    device = get_device(device)
 
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = Path(checkpoint_path)
     checkpoint = load_checkpoint(checkpoint_path)
     model = rebuild_model(checkpoint)
     model.to(device)
@@ -120,62 +119,49 @@ def main() -> None:
     checkpoint_threshold_grid = [float(t) for t in checkpoint.get("threshold_grid", THRESHOLD_GRID)]
     if not checkpoint_threshold_grid or any(not 0.0 <= t <= 1.0 for t in checkpoint_threshold_grid):
         raise RuntimeError("threshold_grid inválida en el checkpoint.")
-    
-    max_false_alarms_per_hour = ( args.max_false_alarms_per_hour if args.max_false_alarms_per_hour is not None else event_config.get("max_false_alarms_per_hour", MAX_FALSE_ALARMS_PER_HOUR))
-    positives_for_event = args.positives_for_event if args.positives_for_event is not None else event_config.get("n_within", POSITIVES_FOR_EVENT)
-    window_range_for_event = args.window_range_for_event if args.window_range_for_event is not None else event_config.get("n_window", WINDOW_RANGE_FOR_EVENT)
-    event_min_alarm_interval = args.event_min_alarm_interval if args.event_min_alarm_interval is not None else event_config.get("min_alarm_interval", EVENT_MIN_ALARM_INTERVAL)
-    event_max_latency = args.event_max_latency if args.event_max_latency is not None else event_config.get("max_latency", EVENT_MAX_LATENCY)
+
+    max_false_alarms_per_hour = event_config.get("max_false_alarms_per_hour", MAX_FALSE_ALARMS_PER_HOUR)
+    positives_for_event = event_config.get("n_within", POSITIVES_FOR_EVENT)
+    window_range_for_event = event_config.get("n_window", WINDOW_RANGE_FOR_EVENT)
+    event_min_alarm_interval = event_config.get("min_alarm_interval", EVENT_MIN_ALARM_INTERVAL)
+    event_max_latency = event_config.get("max_latency", EVENT_MAX_LATENCY)
     if max_false_alarms_per_hour <= 0:
-        raise ValueError("max_false_alarms_per_hour debe ser mayor que cero")
+        raise RuntimeError("max_false_alarms_per_hour debe ser mayor que cero")
     if positives_for_event <= 0 or window_range_for_event <= 0 or positives_for_event > window_range_for_event:
-        raise ValueError("Configuración de ventanas de evento inválida")
+        raise RuntimeError("Configuración de ventanas de evento inválida")
     if event_min_alarm_interval < 0 or event_max_latency < 0:
-        raise ValueError("Los intervalos de evento no pueden ser negativos")
+        raise RuntimeError("Los intervalos de evento no pueden ser negativos")
 
-    threshold = args.threshold if args.threshold is not None else checkpoint.get("op_threshold")
-    if threshold is None:
-        if args.split == "test":
+    thr = threshold if threshold is not None else checkpoint.get("op_threshold")
+    if thr is None:
+        if split_name == "test":
             raise RuntimeError("El checkpoint no contiene op_threshold seleccionado en validación.")
-        threshold = checkpoint.get("threshold", THRESHOLD)
-
-    # Metadata del checkpoint 
-    print("=" * 70)
-    print("EVALUACIÓN DE CHECKPOINT")
-    print("=" * 70)
-    print(f"  Checkpoint:      {checkpoint_path.name}")
-    print(f"  Época guardada:  {checkpoint.get('epoch', '?')}")
-    print(f"  best_val_loss:   {checkpoint.get('best_val_loss', float('nan')):.6f}")
-    print(f"  pos_weight:      {checkpoint.get('pos_weight', '?')}")
-    print(f"  seed:            {checkpoint.get('seed', '?')}")
-    print(f"  threshold:       {threshold}")
-    print(f"  split a evaluar: {args.split}")
-
-    # Carga el split que se quiere evaluar.
-    split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+        thr = checkpoint.get("threshold", THRESHOLD)
+#tests de consistencia
     checkpoint_split_id = checkpoint.get("split_id")
     current_split_id = split_id(split)
     if checkpoint_split_id != current_split_id:
-        raise RuntimeError("El checkpoint y el split no coinciden: "
-            f"checkpoint={checkpoint_split_id}, split={current_split_id}."
+        raise RuntimeError(
+            f"El checkpoint y el split no coinciden: checkpoint={checkpoint_split_id}, split={current_split_id}."
         )
     # El scaler_stats viene adentro del checkpoint y lo uso para escalar las ventanas de val/test EXACTAMENTE igual que en train
     scaler_stats = checkpoint.get("scaler_stats")
     if scaler_stats is None:
-        sys.exit("El checkpoint no contiene estadísticas del scaler.")
+        raise RuntimeError("El checkpoint no contiene estadísticas del scaler.")
     validate_checkpoint_scaler(checkpoint, scaler_stats)
     if scaler_stats["split_id"] != current_split_id:
         raise RuntimeError("El scaler embebido en el checkpoint no corresponde al split solicitado.")
 
     # armo train/val/test. Para val/test recorre TODAS las ventanas en orden (sin undersampling, sin shuffle)
     # Construye datasets con el scaler embebido en el checkpoint.
-    loaders = build_splits_dataloaders(args.data_dir, split, scaler_stats,batch_size=args.batch_size, num_workers=args.num_workers, limit_files=args.limit_files,)
-    dataset = loaders[args.split]["dataset"] #acá corro --split test o --split val t elijo
-    loader = loaders[args.split]["dataloader"]
+    loaders = build_splits_dataloaders(data_dir, split, scaler_stats,
+                                       batch_size=batch_size, num_workers=num_workers,
+                                       limit_files=limit_files)
+    dataset = loaders[split_name]["dataset"]
+    loader = loaders[split_name]["dataloader"]
 
     n_pos = int(dataset.n_positive)
     n_total = len(dataset)
-    print(f"  Ventanas {args.split}: {n_total}  ({n_pos} positivas, {n_total - n_pos} negativas)")
 
     # evaluar
     # mido el error sobre la distribución natural, x ende el Binary Cross entropy va sin pos-weight
@@ -184,17 +170,104 @@ def main() -> None:
 
     # Métricas clínicas sobre TODAS las ventanas del split
     #Construyo el índice global ventana -> (archivo, ventana local) y el vector de label
-    dataset._ensure_index()#pq hago esto acpa?
-    m = binary_metrics(probs, labels, threshold, file_ids=dataset.file_ids, local_ids=dataset.local_ids,)
+    dataset._ensure_index()
+    m = binary_metrics(probs, labels, thr, file_ids=dataset.file_ids, local_ids=dataset.local_ids)
     rk = rank_metrics(probs, labels)
 
+    event_selection = "checkpoint_threshold"
+    event_warning: str | None = None
+    if split_name == "test" or not reselect_operating_point:
+        # En test y en evaluaciones que piden umbral fijo, no se recalibra.
+        ev = event_metrics(
+            probs, labels,
+            file_ids=dataset.file_ids, local_ids=dataset.local_ids,
+            valid_files=dataset.valid_files, annotations=dataset.annotations,
+            threshold=thr,
+            n_within=positives_for_event, n_window=window_range_for_event,
+            min_alarm_interval=event_min_alarm_interval, max_latency=event_max_latency,
+        )
+    else:
+        ev, ev_threshold = select_event_operating_point(
+            probs, labels,
+            file_ids=dataset.file_ids, local_ids=dataset.local_ids,
+            valid_files=dataset.valid_files, annotations=dataset.annotations,
+            max_false_alarms_per_hour=max_false_alarms_per_hour,
+            n_within=positives_for_event, n_window=window_range_for_event,
+            min_alarm_interval=event_min_alarm_interval, max_latency=event_max_latency,
+            thresholds=checkpoint_threshold_grid,
+        )
+        event_selection = "operating_point"
+        if ev is None:
+            # Ningún umbral respeta el techo: fallback explícito al de menor mediana.
+            ev, ev_threshold = select_lowest_false_alarm_point(
+                probs, labels,
+                file_ids=dataset.file_ids, local_ids=dataset.local_ids,
+                valid_files=dataset.valid_files, annotations=dataset.annotations,
+                n_within=positives_for_event, n_window=window_range_for_event,
+                min_alarm_interval=event_min_alarm_interval, max_latency=event_max_latency,
+                thresholds=checkpoint_threshold_grid,
+            )
+            event_selection = "fallback"
+            event_warning = (f"Ningún umbral respetó el techo de {max_false_alarms_per_hour:.0f} "
+                             f"falsas alarmas/h. Mostrando el de menor mediana (umbral {ev_threshold:.2f}).")
+        thr = ev_threshold
+
+    return {
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_name": checkpoint_path.name,
+        "split": split_name,
+        "epoch": checkpoint.get("epoch"),
+        "best_val_loss": checkpoint.get("best_val_loss"),
+        "pos_weight": checkpoint.get("pos_weight"),
+        "seed": checkpoint.get("seed"),
+        "threshold": float(thr),
+        "event_selection": event_selection,
+        "event_warning": event_warning,
+        "event_config": {
+            "n_within": positives_for_event,
+            "n_window": window_range_for_event,
+            "min_alarm_interval": event_min_alarm_interval,
+            "max_latency": event_max_latency,
+            "max_false_alarms_per_hour": max_false_alarms_per_hour,
+        },
+        "n_windows": n_total,
+        "n_positive": n_pos,
+        "loss": avg_loss,
+        "ranking": rk,
+        "window": m,
+        "event": ev,
+    }
+
+
+def print_evaluation_report(result: dict) -> None:
+    """Imprime el reporte de `evaluate_checkpoint_on_split` (salida histórica del CLI)."""
+    ec = result["event_config"]
+    m = result["window"]
+    rk = result["ranking"]
+    ev = result["event"]
+    thr = result["threshold"]
+    split_name = result["split"]
+
+    print("=" * 70)
+    print("EVALUACIÓN DE CHECKPOINT")
+    print("=" * 70)
+    print(f"  Checkpoint:      {result['checkpoint_name']}")
+    print(f"  Época guardada:  {result['epoch'] if result['epoch'] is not None else '?'}")
+    print(f"  best_val_loss:   {result['best_val_loss'] if result['best_val_loss'] is not None else float('nan'):.6f}")
+    print(f"  pos_weight:      {result['pos_weight'] if result['pos_weight'] is not None else '?'}")
+    print(f"  seed:            {result['seed'] if result['seed'] is not None else '?'}")
+    print(f"  threshold:       {thr}")
+    print(f"  split a evaluar: {split_name}")
+    print(f"  Ventanas {split_name}: {result['n_windows']}  "
+          f"({result['n_positive']} positivas, {result['n_windows'] - result['n_positive']} negativas)")
+
     print("-" * 70)
-    print(f"  Loss promedio ({args.split}):  {avg_loss:.6f}")
+    print(f"  Loss promedio ({split_name}):  {result['loss']:.6f}")
     if rk["auc_roc"] is not None:
         print(f"  AUC-ROC:                        {rk['auc_roc']:.4f}")
     if rk["auprc"] is not None:
         print(f"  AUPRC (average precision):      {rk['auprc']:.4f}")
-    print(f"  [NIVEL VENTANA @ umbral {threshold:.2f}]")
+    print(f"  [NIVEL VENTANA @ umbral {thr:.2f}]")
     print(f"  Sensibilidad (recall):          {m['sensibility']:.4f}")
     print(f"  Especificidad:                  {m['specificity']:.4f}")
     print(f"  FPR (tasa falsos positivos):    {m['false_positive_rate']:.4f}")
@@ -205,63 +278,22 @@ def main() -> None:
     print(f"  Conteos -> TP={m['actual_positive']}  FP={m['false_positive']}  "
           f"TN={m['actual_negative']}  FN={m['false_negative']}")
 
-    # Métricas a nivel evento + punto de operación clínico
-    if args.split == "test":
-        ev_threshold = threshold
-        ev = event_metrics(probs,labels,file_ids=dataset.file_ids,
-            local_ids=dataset.local_ids,
-            valid_files=dataset.valid_files,
-            annotations=dataset.annotations,
-            threshold=ev_threshold,
-            n_within=positives_for_event,
-            n_window=window_range_for_event,
-            min_alarm_interval=event_min_alarm_interval,
-            max_latency=event_max_latency,
-        )
+    if result["event_warning"]:
+        print(f"\n  [WARN] {result['event_warning']}")
+    if split_name == "test":
         print("\n  [NIVEL EVENTO]")
-        print(f"  Métricas sobre test usando threshold fijado en validación: {ev_threshold:.2f}")
-    else:
-        ev, ev_threshold = select_event_operating_point(
-            probs, labels,
-            file_ids=dataset.file_ids, local_ids=dataset.local_ids,
-            valid_files=dataset.valid_files, annotations=dataset.annotations,
-            max_false_alarms_per_hour=max_false_alarms_per_hour,
-            n_within=positives_for_event, n_window=window_range_for_event,
-            min_alarm_interval=event_min_alarm_interval,
-            max_latency=event_max_latency,
-            thresholds=checkpoint_threshold_grid,
-        )
-
-    if ev is None:
-        # Ningún umbral respeta el techo; se muestra un fallback explícito.
-        ev, ev_threshold = select_lowest_false_alarm_point(
-            probs,
-            labels,
-            file_ids=dataset.file_ids,
-            local_ids=dataset.local_ids,
-            valid_files=dataset.valid_files,
-            annotations=dataset.annotations,
-            n_within=positives_for_event,
-            n_window=window_range_for_event,
-            min_alarm_interval=event_min_alarm_interval,
-            max_latency=event_max_latency,
-            thresholds=checkpoint_threshold_grid,
-        )
-        print("\n  [NIVEL EVENTO]")
-        print(f"  [WARN] Ningún umbral respetó el techo de {max_false_alarms_per_hour:.0f} falsas alarmas/h. "
-              f"Mostrando el de menor mediana (umbral {ev_threshold:.2f}).")
-    elif args.split == "test":
-        print(f"  Threshold aplicado: {ev_threshold:.2f}")
+        print(f"  Threshold aplicado: {thr:.2f}")
     else:
         print("\n  [NIVEL EVENTO (crisis)]")
-        print(f"  Punto de operación (mediana de falsas alarmas <= {max_false_alarms_per_hour:.1f}/h, mayor sensibilidad): "
-              f"umbral={ev_threshold:.2f}  mediana={ev['median_false_alarms_per_hour']:.2f}/h")
+        if result["event_selection"] == "operating_point":
+            print(f"  Punto de operación (mediana de falsas alarmas <= {ec['max_false_alarms_per_hour']:.1f}/h, mayor sensibilidad): "
+                  f"umbral={thr:.2f}  mediana={ev['median_false_alarms_per_hour']:.2f}/h")
 
     print(f"  Sensibilidad:              {ev['sensibility']:.4f}  ({ev['n_detected']}/{ev['n_seizures']} crisis detectadas)")
     print(f"  Falsas alarmas de evento/h: {ev['event_false_alarms_per_hour']:.4f}  (mediana por paciente: {ev['median_false_alarms_per_hour']:.4f})  ({ev['n_false_alarms']} falsas alarmas en {ev['total_hours']:.1f} h cubiertas)")
     print(f"  Latencia media:            {ev['latency_mean']:.2f} s")
     print(f"  Latencia mediana:          {ev['latency_median']:.2f} s")
-    print(f"  Postprocesado:             >= {positives_for_event} positivos en {window_range_for_event} ventanas consecutivas")
+    print(f"  Postprocesado:             >= {ec['n_within']} positivos en {ec['n_window']} ventanas consecutivas")
     print("  Desglose por paciente:")
     for patient, patient_metrics in sorted(ev["by_patient"].items()):
         print(
@@ -270,6 +302,29 @@ def main() -> None:
             f"falsas alarmas/h={patient_metrics['false_alarms_per_hour']:.4f}"
         )
     print("=" * 70)
+
+
+def main() -> None:
+    args = parse_args()
+
+    split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+
+    try:
+        result = evaluate_checkpoint_on_split(
+            args.checkpoint,
+            data_dir=args.data_dir,
+            split=split,
+            split_name=args.split,
+            device=args.device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            threshold=args.threshold,
+            limit_files=args.limit_files,
+        )
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+
+    print_evaluation_report(result)
 
 
 if __name__ == "__main__":

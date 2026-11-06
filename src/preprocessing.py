@@ -3,8 +3,9 @@ Preprocesamiento de señales EEG de CHB-MIT.
 
 Convierte un archivo `.edf` crudo en ventanas etiquetadas listas para la cnn
 
-    python -m src.preprocessing --compute-stats             # stats del scaler sobre TRAIN
     python -m src.preprocessing --test-file <archivo.edf>   # smoke-test de un solo archivo
+
+El cálculo global de stats para entrenamientos sin CV queda conservado pero comentado.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from src.config import (
     ROBUST_QUANTILE_RANGE,
     SCALER,
     SCALER_STATS_FILE,
-    SPLIT_FILE,
+#    SPLIT_FILE,  # Solo se usaba para el cálculo global de stats sin CV.
     STATS_SAMPLE_STRIDE,
     STATS_WINDOW_STRIDE,
     STRIDE_SAMPLES,
@@ -371,8 +372,8 @@ def load_scaler_stats(path: Path = SCALER_STATS_FILE) -> dict | None:
             # pedimos regenerarlo en vez de cargar stats que ya no corresponden.
             raise RuntimeError(
                 f"scaler_stats.npz contiene el escalador '{scaler_name}' y el "
-                "proyecto usa SOLO RobustScaler. Regeneralo con: "
-                "python -m src.preprocessing --compute-stats"
+                "proyecto usa SOLO RobustScaler. Regenerá las stats con "
+                "compute_stats_for_patients dentro del flujo de CV."
             )
         stats = {
             "scaler": scaler_name,
@@ -516,50 +517,73 @@ def process_edf(path, seizures: list[tuple[int, int]], *, fs: int = FS, win_samp
 
 # HELPERS DEL CLI---------------------------------------------------------------------
 
-def _train_files_from_split(data_dir: Path, split: dict) -> list[Path]:
-    """Lista de EDFs (solo los anotados en el summary) para los pacientes de train."""
-    files: list[Path] = []
-    for patient in split["train"]:
-        files.extend(files_for_patient(data_dir, patient))
-    return files
 
+def compute_stats_for_patients(data_dir: Path | str, patients: list[str], *, split: dict | None = None, out: Path | None = None, limit: int | None = None, verbose: bool = True, ) -> dict:
+    """Computa las stats del RobustScaler usando los archivos de patients.
 
-def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients: list[str] | None, out: Path = SCALER_STATS_FILE,) -> None:
-    # Lee el split para saber qué pacientes forman el train del scaler.
-    split = json.loads(split_file.read_text(encoding="utf-8"))
+    Cada fold debe calcular mediana/IQR con los pacientes de su TRAIN, nunca con el scaler global
+    (que vería a los pacientes de validación a través del escalado y filtraría información syua al entrenamiento).
+    Devuelve el dict de stats y persiste el .npz en la ruta de out
+
+    - `split`: dict de split del fold (opcional). Si se pasa, su id se embebe en las stats para que coincida con el del checkpoint del fold.
+    - `limit`: trunca a los primeros N archivos (solo para smoke-tests)
+    """
+    data_dir = Path(data_dir)
     annotations = load_annotations(data_dir)
 
-    train_files = _train_files_from_split(data_dir, split)
-    
-    #por si quisiera algún paciente en particular o alguna cantidad de archivos como límite en particular. por lo pronto no lo uso
-    #pero capaz cuadno haga las próximas fases sí
-    if patients:
-        wanted = set(patients)
-        train_files = [p for p in train_files if p.parent.name in wanted]
-        if not train_files:
-            sys.exit("Ningún archivo de los pacientes pedidos quedó en TRAIN.")
+    # Archivos anotados de los pacientes pedidos (cada uno ~1 h de registro).
+    files: list[Path] = []
+    for patient in patients:
+        files.extend(files_for_patient(data_dir, patient))
+    if not files:
+        raise RuntimeError("No hay EDFs anotados para los pacientes pedidos.")
     if limit is not None:
-        train_files = train_files[:limit]
+        files = files[:limit]
 
-    files_by_name = {p.name: p for p in train_files}
-    seizures_by_file = {}
-    for patient, files in annotations.items(): #annotations me trae paciente: {nombre de archivo: intervalos de crisis}
-        for fname, seizure_intervals in files.items(): #cada intervalo es una tupla de inicio en segundos y fin en segundos
-            if fname in files_by_name: #annotations tiene data de pacientes q no están en train, entonces los salteo
+    # Intervalos de crisis por archivo, descartando las anotaciones de pacientes que no pertenecen a este conjunto
+    files_by_name = {p.name: p for p in files}
+    seizures_by_file: dict[str, list[tuple[int, int]]] = {}
+    for patient, patient_files in annotations.items():
+        for fname, seizure_intervals in patient_files.items():
+            if fname in files_by_name:
                 seizures_by_file[fname] = seizure_intervals
 
-    print(f"\nComputando stats del scaler (scaler='{SCALER}') sobre "
-          f"{len(train_files)} archivos de TRAIN...")
-    
-    stats = preprocess_train_data(train_files, seizures_by_file)
+    if verbose:
+        print(f"\nComputando stats del scaler (scaler='{SCALER}') sobre "
+              f"{len(files)} archivos de {len(patients)} pacientes...")
+
+    stats = preprocess_train_data(files, seizures_by_file, verbose=verbose)
     stats["protocol_version"] = PROTOCOL_VERSION
-    stats["split_id"] = split_id(split)
+    stats["split_id"] = split_id(split) if split is not None else ""
     stats["scaler_id"] = scaler_id(stats)
     stats["preprocessing_config"] = preprocessing_config()
-    # Guarda las estadísticas en la ruta específica del escenario o del modelo final.
-    save_stats(stats, out)
-    
-    print(f"Stats guardadas en: {out}")
+
+    if out is not None:
+        # Guarda las estadísticas en la ruta pedida (p. ej. para reproducir un fold).
+        save_stats(stats, Path(out))
+        if verbose:
+            print(f"Stats guardadas en: {out}")
+    return stats
+
+
+#NO SE EJECUTA EN EL FLUJO ACTUAL DE CROSS VALIDATION, LO DEJO POR COMPATIBILIDAD Y POR SI EN ALGÚN MOMENTO QUIERO VOLVER PARA ATRÁS A UN ENTRENAMIENTO SIN CV
+def compute_stats(data_dir: Path, split_file: Path, limit: int | None, patients: list[str] | None, out: Path = SCALER_STATS_FILE,) -> None:
+    """stats del escalador sobre el TRAIN del split fijo (split.json)."""
+    # Lee el split para saber qué pacientes forman el train del scaler.
+    split = json.loads(split_file.read_text(encoding="utf-8"))
+    train_patients = list(split["train"])
+
+    # Filtro opcional de pacientes (se conserva por compatibilidad con el CLI).
+    if patients:
+        wanted = set(patients)
+        train_patients = [p for p in train_patients if p in wanted]
+        if not train_patients:
+            sys.exit("Ningún archivo de los pacientes pedidos quedó en TRAIN.")
+
+    stats = compute_stats_for_patients(
+        data_dir, train_patients, split=split, out=out, limit=limit,
+    )
+
     print("\nmediana por canal (center_):", np.array2string(stats["median"], precision=3, suppress_small=False))
     print("IQR por canal (scale_):     ", np.array2string(stats["iqr"], precision=3, suppress_small=False))
     print(f"Ventanas de train usadas: {stats['n_windows']} | archivos: {stats['n_files']}")
@@ -613,51 +637,44 @@ def main() -> None:
     #creo el parser y los argumentos q puede llegar a recibir
     parser = argparse.ArgumentParser(description="Preprocesamiento de EDFs CHB-MIT")
     parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
-    parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
-    parser.add_argument(
-        "--stats-out",
-        type=str,
-        default=str(SCALER_STATS_FILE),
-        help="Ruta del scaler .npz a generar.",
-    )
+    # Argumentos históricos del cálculo global para entrenamiento sin CV.
+    # parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
+    # parser.add_argument("--stats-out", type=str, default=str(SCALER_STATS_FILE))
     parser.add_argument(
         "--scaler-stats",
         type=str,
         default=str(SCALER_STATS_FILE),
         help="Ruta del scaler .npz a usar en --test-file.",
     )
-    parser.add_argument("--limit", type=int, default=None, help="Procesar solo N archivos (smoke-test).")
-    parser.add_argument("--patients", type=str, default=None, help="Solo estos pacientes (csv).")
+    # parser.add_argument("--limit", type=int, default=None, help="Límite del cálculo global.")
+    # parser.add_argument("--patients", type=str, default=None, help="Pacientes del cálculo global.")
 
-    # acciones posibles. Solo puedo elegir una
+    # Acciones disponibles por CLI.
     group = parser.add_mutually_exclusive_group(required=True)
     # group.add_argument("--report", action="store_true", help="Escaneo de header de todos los EDF.")
-    group.add_argument("--compute-stats", action="store_true", help="Stats de la estandarización.")
+    # Entrenamiento individual sin CV: se conserva comentado por si hiciera falta.
+    # group.add_argument("--compute-stats", action="store_true", help="Stats globales del scaler.")
     group.add_argument("--test-file", type=str, help="Procesar un único EDF de prueba.")
 
     # lee sys.argv, chequea que los flags sean válidos
     args = parser.parse_args()
 
-    if args.limit is not None and args.limit <= 0:
-        parser.error("--limit debe ser mayor que cero")
-    
     data_dir = Path(args.data_dir)
     if not data_dir.is_dir():
         sys.exit(f"--data-dir no es válido: {data_dir}")
 
-    if args.compute_stats:
-        patients = args.patients.split(",") if args.patients else None
-        compute_stats(
-            data_dir,
-            Path(args.split_file),
-            args.limit,
-            patients,
-            Path(args.stats_out),
-        )
-
-    #test para un solo archivo (no es para prod)
-    else: 
-        test_file_cli(data_dir, args.test_file, Path(args.scaler_stats))
+    # if args.compute_stats:
+    #     patients = args.patients.split(",") if args.patients else None
+    #     compute_stats(
+    #         data_dir,
+    #         Path(args.split_file),
+    #         args.limit,
+    #         patients,
+    #         Path(args.stats_out),
+    #     )
+    #
+    # Smoke-test de preprocesamiento de un único EDF.
+    test_file_cli(data_dir, args.test_file, Path(args.scaler_stats))
 
 
 if __name__ == "__main__":

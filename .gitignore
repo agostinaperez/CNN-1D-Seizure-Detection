@@ -41,6 +41,9 @@ models/unused/
 *.history.json
 *.docx
 
+# Artefactos de la validación cruzada (grandes y reproducibles desde folds.json).
+results/
+
 # Variables de entorno / credenciales — NUNCA subir esto
 .env
 *.env.local
