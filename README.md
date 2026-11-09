@@ -70,7 +70,7 @@ Las señales EEG son continuas, no estacionarias y con fuerte desbalance entre c
 - Balanceo mediante submuestreo de la clase mayoritaria (`NEG_POS_RATIO = 3`) y augmentación con ruido gaussiano solo en ventanas de crisis.
 
 ### Modelo(s)
-
+TODO: CAMBIAR ESTO PQ ABAJO HABLA DE SPLIT FIJO
 Se entrenó una CNN-1D de 6 bloques (Conv1d + BatchNorm + ReLU + MaxPool) seguidos de Global Average Pooling y una capa densa. Se compararon dos funciones de pérdida:
 
 | Configuración | Pérdida | AUPRC (val) | Sens. evento (val) | Falsas alarmas/h (mediana, val) |
@@ -84,9 +84,18 @@ El checkpoint se elige por el *punto de operación clínico* (máxima sensibilid
 
 Validación: split inter-paciente fijo (train/val/test, sin mezclar ventanas del mismo paciente entre particiones) para evitar fuga de datos. El punto de operación (umbral) se elige en validación maximizando la sensibilidad de crisis sujeta a un techo de falsas alarmas (mediana ≤ 1/h por paciente), con postprocesado a nivel de evento (≥2 positivas en 3 ventanas consecutivas, intervalo mínimo de 4 min entre alarmas).
 
+### Validación cruzada de desarrollo
+
+Se implementó una validación cruzada agrupada por paciente para evaluar las configuraciones de entrenamiento sobre distintas particiones del dataset de desarrollo (train y val, 18 pacientes). Los datos se dividen en K folds, y en cada iteración se entrena el modelo con los pacientes de (K−1) folds y se evalúa con los pacientes del fold restante. Cada fold produce una medida de desempeño y los resultados se resumen mediante la media y el desvío estándar.
+
+La partición se realiza por paciente, no por ventana, para mantener todas las ventanas de cada paciente en un mismo grupo. Se utiliza StratifiedGroupKFold con K=5 y estratificación por severidad de crisis. Los 18 pacientes del pool de desarrollo rotan y aparecen una vez cada uno en validación. El conjunto de test del split fijo se mantiene separado durante la validación cruzada.
+
+En cada fold, las estadísticas del RobustScaler se calculan únicamente con los pacientes de entrenamiento de ese fold. Se comparan las configuraciones `bce`, `focal_a025` y `focal_a075`, manteniendo constantes los demás parámetros del entrenamiento. Para cada configuración se ejecutan cinco entrenamientos, uno por fold, y se reportan AUPRC, AUC-ROC, métricas por ventana y por evento, falsas alarmas por hora y latencia, agregadas entre folds.
+
+La configuración se selecciona según la media de AUPRC de validación; en caso de empate, se prefiere la de menor desvío estándar. Luego se reentrena esa configuración con todo el pool de desarrollo y se evalúa una vez sobre el conjunto de test.
 ---
 
-## Resultados
+## Resultados y comparación contra baseline
 
 Métricas sobre el test congelado inter-paciente (6 pacientes, 34 crisis). Los baselines de comparación son dos modelos de machine learning sobre features
 de ingeniería (potencia espectral de cada ventana en las bandas canónicas del EEG), entrenados como regresión logística y SVM lineal. Se usa el mismo split inter-paciente, el mismo postprocesado de evento y el mismo criterio de punto de operación que la CNN. 
@@ -126,11 +135,11 @@ El modelo es un MVP funcional que supera al baseline, pero no alcanza todavía l
 ├── README.md
 ├── pyproject.toml
 ├── LICENSE
-├── PLAN_CV.md             # plan de validación cruzada (próximo paso)
 ├── INFORME_TECNICO.pdf    # informe técnico del trabajo
 ├── src/                   # código fuente (funciones y módulos propios)
 │   ├── api.py             # API FastAPI + demo de inferencia
-│   └── baseline.py        # baselines clásicos (potencia por banda: LR y SVM lineal)
+│   ├── baseline.py        # baselines clásicos (potencia por banda: LR y SVM lineal)
+│   └── cv.py              # validación cruzada agrupada por paciente
 ├── frontend/              # interfaz web de la demo (Vue 3 + ECharts)
 ├── data/
 │   ├── raw/               # CHB-MIT crudo (~64 GB, NO versionado)
@@ -177,37 +186,25 @@ El dataset solo se necesita para el pipeline completo. En ese caso, setear su ru
 
 ## Uso
 
-### Inferencia sin el dataset
-
-Para inferir sobre un EDF suelto no se necesitan los 64 GB ni `CHBMIT_DIR`: las estadísticas
-del escalador van embebidas en el checkpoint.
-
-```bash
-# Informe ventana a ventana + eventos detectados (JSON en inferences/)
-python -m src.inference --input <archivo.edf> --checkpoint models/alpha025.pt
-```
-
-### Pipeline completo por consola (train/eval, requiere el dataset)
-
 ```bash
 # Split inter-paciente (train/val/test) -> data/processed/split.json
 python -m src.split --data-dir <ruta/chbmit/1.0.0>
 
-# Stats del escalador robusto -> data/processed/scaler_stats.npz
-python -m src.preprocessing --compute-stats --data-dir <ruta/chbmit/1.0.0>
+# 5 folds agrupados por paciente sobre el pool de desarrollo (18 pacientes). Salidas en results/cv/. Incluye la evaluación con split de test
+python -m src.cv --data-dir <ruta/chbmit/1.0.0> --folds 5 --seed 42
 
-# Entrenar (BCE y Focal)
-python -m src.train --data-dir <ruta/chbmit/1.0.0> --out models/bce.pt --loss bce --seed 42
-python -m src.train --data-dir <ruta/chbmit/1.0.0> --out models/focal.pt --loss focal --seed 42
-
-# Evaluar el checkpoint elegido sobre test
-python -m src.evaluate --checkpoint models/focal.pt --split test --data-dir <ruta/chbmit/1.0.0>
+Costo: son 15 entrenamientos completos (3 configs × 5 folds), pensados para GPU (Colab). Cada época guarda en `--out-dir` un estado reanudable (`.resume.pt`) y el mejor checkpoint del fold; al completar un fold, también persiste sus métricas. 
 
 # Baselines clásicos (regresión logística / SVM lineal sobre potencia por banda)
 python -m src.baseline --data-dir <ruta/chbmit/1.0.0> --model all
 ```
 
-La inferencia procesa un EDF pregrabado completo y reporta, por ventana, si detecta crisis; el informe detallado se guarda en `inferences/`.
+Para inferir sobre un EDF suelto no se necesitan los 64 GB ni `CHBMIT_DIR`: las estadísticas del escalador van embebidas en el checkpoint.
+
+```bash
+# Informe ventana a ventana + eventos detectados (JSON en inferences/)
+python -m src.inference --input <archivo.edf> --checkpoint models/alpha025.pt
+```
 
 ### Inferencia con interfaz web.
 
