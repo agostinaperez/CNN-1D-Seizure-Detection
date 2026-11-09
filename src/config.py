@@ -161,3 +161,13 @@ CONV_CHANNELS = [64, 128, 256, 256, 256, 256]
 CONV_KERNELS = [7, 5, 5, 3, 3, 3]
 # Neurons de las capas densas finales.
 FC_UNITS = 256
+
+# Pool de desarrollo = pacientes de train + val del split fijo Cada fold entrena sobre K-1 particiones de
+# pacientes y evalúa sobre la restante, agrupando por paciente para no fugar información entre ventanas del mismo sujeto
+CV_FOLDS = 5
+# Semilla de la partición de folds
+CV_SEED = 42
+# Configuraciones a comparar en la CV
+CV_CONFIGS = ["bce", "focal_a025", "focal_a075"]
+# Directorio de salida de la CV (artefactos: folds.json, resúmenes, historiales).
+CV_OUT_DIR = BASE_DIR / "results" / "cv"

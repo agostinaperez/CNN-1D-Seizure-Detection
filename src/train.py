@@ -25,7 +25,7 @@ from src.config import (
     BATCH_SIZE,
     CONV_CHANNELS,
     CONV_KERNELS,
-    DATASET_DIR,
+#    DATASET_DIR,  # Solo se usaba en el CLI de entrenamiento individual.
     DROPOUT,
     EVENT_MAX_LATENCY,
     EVENT_MIN_ALARM_INTERVAL,
@@ -36,16 +36,16 @@ from src.config import (
     LEARNING_RATE,
     LOSS,
     MAX_FALSE_ALARMS_PER_HOUR,
-    MODELS_DIR,
+#    MODELS_DIR,  # Solo se usaba en el CLI de entrenamiento individual.
     N_CHANNELS,
     NEG_POS_RATIO,
     NOISE_STD,
     NUM_WORKERS,
     PATIENCE,
     POSITIVES_FOR_EVENT,
-    SCALER_STATS_FILE,
+#    SCALER_STATS_FILE,  # Solo se usaba en el CLI de entrenamiento individual.
     SEED,
-    SPLIT_FILE,
+#    SPLIT_FILE,  # Solo se usaba en el CLI de entrenamiento individual.
     THRESHOLD,
     WEIGHT_DECAY,
     WINDOW_RANGE_FOR_EVENT,
@@ -65,7 +65,7 @@ from src.metrics import (
     select_lowest_false_alarm_point,
 )
 from src.model import SeizureCNN
-from src.preprocessing import load_scaler_stats
+# from src.preprocessing import load_scaler_stats  # CLI histórico desactivado.
 from src.protocol import (
     THRESHOLD_GRID,
     compatibility_config,
@@ -206,7 +206,8 @@ def save_checkpoint( path: Path, model: nn.Module,scaler_stats: dict, *, split: 
     best_val_loss: float, checkpoint_val_loss: float, pos_weight: float, seed: int, event_config: dict,
     op_threshold: float | None, op_metrics: dict | None, event_feasible: bool,
     validation_auprc: float | None, selection_metric: str, training_config: dict,
-    loss: str = LOSS, focal_gamma: float = FOCAL_GAMMA, focal_alpha: float = FOCAL_ALPHA,) -> None:
+    loss: str = LOSS, focal_gamma: float | None = FOCAL_GAMMA,
+    focal_alpha: float | None = FOCAL_ALPHA,) -> None:
     """
     Guarda lo necesario para re-usar el modelo sin re-entrenar:
 
@@ -268,99 +269,108 @@ def save_checkpoint( path: Path, model: nn.Module,scaler_stats: dict, *, split: 
         "focal_alpha": focal_alpha,
         "seed": seed,
     }
-    torch.save(checkpoint, path)
+    temporary_path = path.with_name(path.name + ".tmp")
+    torch.save(checkpoint, temporary_path)
+    temporary_path.replace(path)
 
 
-def parse_args() -> argparse.Namespace:
-    # Los flags permiten ajustar la corrida sin tocar config.py (para Colab, qpaso --data-dir y --split-file con las rutas de Drive)
-    parser = argparse.ArgumentParser(description="Entrenamiento CNN-1D")
-    parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
-    parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
-    parser.add_argument("--scaler-stats", type=str, default=str(SCALER_STATS_FILE))
-    parser.add_argument("--out", type=str, default=str(MODELS_DIR / "best.pt"),  help="Ruta del checkpoint a guardar.")
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
-    parser.add_argument("--patience", type=int, default=PATIENCE)
-    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
-    parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
-    parser.add_argument("--noise-std", type=float, default=NOISE_STD,
-                        help="Desvío del ruido agregado solo a ventanas positivas durante train.")
-    parser.add_argument("--loss", type=str, default=LOSS, choices=["bce", "focal"],
-                        help="Función de pérdida de entrenamiento: 'bce' (BCE+pos_weight) o 'focal' (Focal Loss).")
-    parser.add_argument("--focal-gamma", type=float, default=FOCAL_GAMMA, help="Gamma del Focal Loss.")
-    parser.add_argument("--focal-alpha", type=float, default=FOCAL_ALPHA, help="Alpha (peso de la clase crisis) del Focal Loss.")
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
-    parser.add_argument("--limit-files", type=int, default=None, help="Limitar a N EDFs por split (smoke-test rápido).")
-    args = parser.parse_args()
-    if args.epochs <= 0:
-        parser.error("--epochs debe ser mayor que cero")
-    if args.batch_size <= 0:
-        parser.error("--batch-size debe ser mayor que cero")
-    if args.patience <= 0:
-        parser.error("--patience debe ser mayor que cero")
-    if args.neg_pos_ratio < 0:
-        parser.error("--neg-pos-ratio no puede ser negativo")
-    if args.noise_std < 0:
-        parser.error("--noise-std no puede ser negativo")
-    if args.focal_gamma < 0:
-        parser.error("--focal-gamma no puede ser negativo")
-    if not 0.0 < args.focal_alpha <= 1.0:
-        parser.error("--focal-alpha debe estar en (0, 1]")
-    return args
+def _save_resume_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(path.name + ".tmp")
+    torch.save(state, temporary_path)
+    temporary_path.replace(path)
+
+#
+# def parse_args() -> argparse.Namespace:
+#     parser = argparse.ArgumentParser(description="Entrenamiento CNN-1D")
+#     parser.add_argument("--data-dir", type=str, default=str(DATASET_DIR))
+#     parser.add_argument("--split-file", type=str, default=str(SPLIT_FILE))
+#     parser.add_argument("--scaler-stats", type=str, default=str(SCALER_STATS_FILE))
+#     parser.add_argument("--out", type=str, default=str(MODELS_DIR / "best.pt"),
+#                         help="Ruta del checkpoint a guardar.")
+#     parser.add_argument("--epochs", type=int, default=EPOCHS)
+#     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+#     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+#     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+#     parser.add_argument("--patience", type=int, default=PATIENCE)
+#     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
+#     parser.add_argument("--neg-pos-ratio", type=float, default=NEG_POS_RATIO)
+#     parser.add_argument("--noise-std", type=float, default=NOISE_STD)
+#     parser.add_argument("--loss", type=str, default=LOSS, choices=["bce", "focal"])
+#     parser.add_argument("--focal-gamma", type=float, default=FOCAL_GAMMA)
+#     parser.add_argument("--focal-alpha", type=float, default=FOCAL_ALPHA)
+#     parser.add_argument("--seed", type=int, default=SEED)
+#     parser.add_argument("--device", type=str, default=None)
+#     parser.add_argument("--limit-files", type=int, default=None)
+#     args = parser.parse_args()
+#     if args.epochs <= 0 or args.batch_size <= 0 or args.patience <= 0:
+#         parser.error("epochs, batch-size y patience deben ser mayores que cero")
+#     if args.neg_pos_ratio < 0 or args.noise_std < 0 or args.focal_gamma < 0:
+#         parser.error("neg-pos-ratio, noise-std y focal-gamma no pueden ser negativos")
+#     if not 0.0 < args.focal_alpha <= 1.0:
+#         parser.error("--focal-alpha debe estar en (0, 1]")
+#     return args
 
 
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-    device = get_device(args.device)
-    print(f"Device: {device}  (semilla={args.seed})")
+def train_model(*, data_dir: Path | str, split: dict, scaler_stats: dict, out: Path,
+    device: str | None = None, loss: str = LOSS, focal_alpha: float | None = FOCAL_ALPHA, focal_gamma: float | None = FOCAL_GAMMA,
+    batch_size: int = BATCH_SIZE, lr: float = LEARNING_RATE, weight_decay: float = WEIGHT_DECAY, epochs: int = EPOCHS,
+    patience: int = PATIENCE, neg_pos_ratio: float = NEG_POS_RATIO, noise_std: float = NOISE_STD, num_workers: int = NUM_WORKERS,
+    seed: int = SEED, limit_files: int | None = None, fixed_op_threshold: float | None = None, resume: bool = False,) -> dict:
+    """Entrena la CNN sobre el split y guarda el checkpoint + su historial.
 
-    # Carga del split y de las stats del escalador
-    split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
-    scaler_stats = load_scaler_stats(Path(args.scaler_stats))
-    if scaler_stats is None:
-        sys.exit("No existe scaler_stats.npz. Corré primero:\n""    python -m src.preprocessing --compute-stats\n")
+    Modos de operación:
+    1. Con validación: Early stopping por val_loss y selección del checkpoint por el criterio clínico de validación
+       (máxima sensibilidad de evento sujeta a mediana de falsas alarmas <= 1/h, desempate por FDR y AUPRC)
+
+    2. Sin validación: modo refit de la CV. No hay early stopping ni selección clínica (esa decisión ya se tomó en la CV); se entrena
+       una cantidad fija de épocas (el promedio de épocas de los folds), con fixed_op_threshold como umbral operativo.
+    """
+    set_seed(seed)
+    device = get_device(device)
+    print(f"Device: {device}  (semilla={seed})")
+
     current_split_id = split_id(split)
     if not scaler_stats.get("split_id"):
-        sys.exit("El scaler_stats.npz no contiene split_id. Regeneralo con el split actual.")
+        raise RuntimeError("El scaler no contiene split_id. Regeneralo con el split actual.")
     if scaler_stats["split_id"] != current_split_id:
-        sys.exit("El scaler_stats.npz no corresponde al split solicitado. Regeneralo sobre este split.")
+        raise RuntimeError("El scaler no corresponde al split solicitado. Regeneralo sobre este split.")
     if not scaler_stats.get("scaler_id"):
-        sys.exit("El scaler_stats.npz no contiene scaler_id. Regeneralo.")
+        raise RuntimeError("El scaler no contiene scaler_id. Regeneralo.")
     if scaler_stats["scaler_id"] != scaler_id(scaler_stats):
-        sys.exit("El scaler_stats.npz tiene un scaler_id inconsistente. Regeneralo.")
+        raise RuntimeError("El scaler tiene un scaler_id inconsistente. Regeneralo.")
     if scaler_stats.get("preprocessing_config") != preprocessing_config():
-        sys.exit("El scaler_stats.npz fue creado con otro preprocesamiento. Regeneralo.")
+        raise RuntimeError("El scaler fue creado con otro preprocesamiento. Regeneralo.")
 
-    loaders = build_splits_dataloaders(args.data_dir, split, scaler_stats, batch_size=args.batch_size,
-        num_workers=args.num_workers, neg_pos_ratio=args.neg_pos_ratio, seed=args.seed,
-        noise_std=args.noise_std, limit_files=args.limit_files,)
-    #solo uso esto para tener info del dataset e imprimirlo. Sino uso el dataloader
+    loaders = build_splits_dataloaders(data_dir, split, scaler_stats, batch_size=batch_size,
+        num_workers=num_workers, neg_pos_ratio=neg_pos_ratio, seed=seed,
+        noise_std=noise_std, limit_files=limit_files,)
     train_ds = loaders["train"]["dataset"]
     train_loader = loaders["train"]["dataloader"]
     val_ds = loaders["val"]["dataset"]
     val_loader = loaders["val"]["dataloader"]
     # El índice se reutiliza para métricas por archivo y evaluación de eventos.
     val_ds._ensure_index()
+    has_val = len(val_ds) > 0
+    if not has_val and fixed_op_threshold is None:
+        raise RuntimeError("Sin pacientes de validación se requiere fixed_op_threshold (modo refit de la CV).")
+
     #lo calculo aunque solo lo uso si hago el bce con pos weight. Sino, solo lo guardo
-    pos_weight = compute_positive_weight(train_ds, neg_pos_ratio=args.neg_pos_ratio)
+    pos_weight = compute_positive_weight(train_ds, neg_pos_ratio=neg_pos_ratio)
 
     print(f"\nConfiguración de entrenamiento")
     print(f"Train: {len(train_ds)} ventanas ({train_ds.n_positive} positivas, "
-          f"{len(train_ds) - train_ds.n_positive} negativas)")
-    print(f"loss: {args.loss}  |  pos_weight: {pos_weight:.1f}  |  NEG_POS_RATIO: {args.neg_pos_ratio}")
-    print(f"noise_std={args.noise_std}")
-    if args.loss == "focal":
-        print(f"focal_loss: gamma={args.focal_gamma}  alpha={args.focal_alpha}")
-    print(f"batch_size={args.batch_size}  lr={args.lr}  weight_decay={args.weight_decay}  "
-          f"epochs={args.epochs}  patience={args.patience}")
+        f"{len(train_ds) - train_ds.n_positive} negativas)")
+    print(f"loss: {loss}  |  pos_weight: {pos_weight:.1f}  |  NEG_POS_RATIO: {neg_pos_ratio}")
+    print(f"noise_std={noise_std}")
+    if loss == "focal":
+        print(f"focal_loss: gamma={focal_gamma}  alpha={focal_alpha}")
+    print(f"batch_size={batch_size}  lr={lr}  weight_decay={weight_decay}  "
+        f"epochs={epochs}  patience={patience}")
 
     model = SeizureCNN().to(device)
 
-    #Reporte de cómputo (pa la tesis)
+    # Reporte de cómputo
     params_info = count_parameters(model)
     flops_info = measure_flops(model, (1, N_CHANNELS, WIN_SAMPLES))
     hardware_info = {
@@ -370,9 +380,9 @@ def main() -> None:
         "cuda_version": torch.version.cuda if device == "cuda" else None,
     }
     print(f"\n[computo] params={params_info['n_params_total']:,} "
-          f"(trainable={params_info['n_params_trainable']:,})  "
-          f"FLOPs/ventana={flops_info['flops_per_window'] / 1e6:.1f}M  "
-          f"MACs/ventana={flops_info['macs_per_window'] / 1e6:.1f}M")
+              f"(trainable={params_info['n_params_trainable']:,})  "
+              f"FLOPs/ventana={flops_info['flops_per_window'] / 1e6:.1f}M  "
+              f"MACs/ventana={flops_info['macs_per_window'] / 1e6:.1f}M")
 
     # AdamW es Adam + weight decay DESACOPLADO (hat dos formas de meterlo: acoplado, agreganfo el castigo al gradiente, o el desacoplado)
     # El adam solito usa momentum y tasa adaptativa. El weight decay sirve para evitar el overfitting. Penaliza pesos
@@ -380,11 +390,14 @@ def main() -> None:
     # mi loss queda L_total= L + (weight_decay/2) * sumatoria de(weights^2))
     #entonces, acá creo el optimizador AdamW, le paso la lista de todos los pesos, el learning rate inicial, y el weight decay de cuánto achico los pesos.
     #NO HACE NADA TODAVÍA, solo lo creo!
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    if args.loss == "focal":
+    if loss == "focal":
+        # Focal Loss: down-weightea los ejemplos fáciles y enfoca el gradiente en las crisis cortas y los falsos positivos (los casos difíciles).
+        if focal_alpha is None or focal_gamma is None:
+            raise ValueError("Focal Loss requiere focal_alpha y focal_gamma.")
         #acá llamo al forward ese
-        train_criterion = FocalLoss(gamma=args.focal_gamma, alpha=args.focal_alpha)
+        train_criterion = FocalLoss(gamma=focal_gamma, alpha=focal_alpha)
     else:
         #La BCE mide el error de mi predicción con la fórmula L = −[ y·log(p) + (1−y)·log(1−p) ], con p la probabilidad de crisis q predije e y=0 o y=1 según si hay o no
         #la probabilidad p es básicamente la sigmoide de mis logits (los logits son la salida real de mi cnn, yo con la sigmoide q es 1/(1+e^(-logit)) lo llevo a p entre 0 y 1)
@@ -402,14 +415,14 @@ def main() -> None:
         "max_false_alarms_per_hour": MAX_FALSE_ALARMS_PER_HOUR,
     }
     training_config = {
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "weight_decay": args.weight_decay,
-        "epochs_requested": args.epochs,
-        "patience": args.patience,
-        "neg_pos_ratio": args.neg_pos_ratio,
-        "noise_std": args.noise_std,
-        "num_workers": args.num_workers,
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "epochs_requested": epochs,
+        "patience": patience,
+        "neg_pos_ratio": neg_pos_ratio,
+        "noise_std": noise_std,
+        "num_workers": num_workers,
     }
 
     # `val_loss` me controla el early stop pq aparentemente es más estable entre épocas PERO el checkpoint final se elige por el criterio clínico de validación:
@@ -421,89 +434,146 @@ def main() -> None:
     best_op_threshold: float | None = None
     best_op_metrics: dict | None = None
     best_selection_metric = "event_validation"
-    patience_left = args.patience
+    patience_left = patience
     start = time.time()
-    history: list[dict] = []  # métricas por época (para las curvas de loss/accuracy en la tesis)
+    elapsed_before_resume = 0.0
+    history: list[dict] = []  # métricas por época (para las curvas de loss/métricas)
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     peak_ram = peak_ram_mb()
     best_epoch_time_s: float | None = None
+    start_epoch = 1
+    training_complete = False
+    resume_path = out.with_name(out.stem + ".resume.pt")
+    #permite continuar un entrenamiento interrumpido, siempre y cuando la configuración de hiperparámetros sea idéntica a la corrida original
+    if resume and resume_path.is_file():
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        expected_config = {
+            "split_id": current_split_id,
+            "scaler_id": scaler_id(scaler_stats),
+            "loss": loss,
+            "focal_alpha": focal_alpha,
+            "focal_gamma": focal_gamma,
+            "training_config": training_config,
+            "seed": seed,
+            "fixed_op_threshold": fixed_op_threshold,
+        }
+        if state.get("format_version") != 2:
+            raise RuntimeError(f"Versión de estado de reanudación no compatible: {resume_path}")
+        if state.get("config") != expected_config:
+            raise RuntimeError(
+                f"El estado de reanudación no coincide con esta corrida: {resume_path}. "
+                "Usá una carpeta de salida nueva para cambiar la configuración."
+            )
+        model.load_state_dict(state["model_state_dict"])
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        best_val_loss = state["best_val_loss"]
+        best_selection_key = state["best_selection_key"]
+        best_epoch = state["best_epoch"]
+        best_op_threshold = state["best_op_threshold"]
+        best_op_metrics = state["best_op_metrics"]
+        best_selection_metric = state["best_selection_metric"]
+        patience_left = state["patience_left"]
+        history = state["history"]
+        elapsed_before_resume = state["elapsed_seconds"]
+        best_epoch_time_s = state["best_epoch_time_s"]
+        start_epoch = state["epoch"] + 1
+        training_complete = state["training_complete"]
+        random.setstate(state["python_rng_state"])
+        np.random.set_state(state["numpy_rng_state"])
+        torch.set_rng_state(state["torch_rng_state"])
+        cuda_rng_states = state.get("cuda_rng_states")
+        if cuda_rng_states and torch.cuda.is_available():
+            if len(cuda_rng_states) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all(cuda_rng_states)
+            else:
+                print("Aviso: cambió la cantidad de GPUs; se reanuda sin restaurar su estado aleatorio.")
+        train_epoch_dataset = train_loader.dataset
+        train_epoch_dataset.rng.bit_generator.state = state["train_rng_state"]
+        train_epoch_dataset.noise_rng.bit_generator.state = state["noise_rng_state"]
+        print(f"Reanudando desde la época {start_epoch} usando {resume_path}")
 
-    print(f"\n=== Entrenamiento ({args.epochs} épocas máx.) ===")
+    print(f"\n=== Entrenamiento ({epochs} épocas máx.) ===")
     print(f"{'Ep':>3} | {'train_loss':>12} | {'val_loss':>12} | {'sens':>10} | {'spec':>10} | "
-          f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
+        f"{'fpr':>10} | {'fp/h':>10} | {'acc':>10} | {'tiempo':>8}")
 
-    for epoch in range(1, args.epochs + 1):
+    epoch = start_epoch - 1
+    for epoch in (range(start_epoch, epochs + 1) if not training_complete else ()):
         t_epoch = time.time()
         #TRAIN LOSS SE CALCULA SOBRE LOS DATOS DE TRAIN, Q ESTÁN BALANCEADOS. SE MIDE MIENTRAS EL MODELO SE ACTUALIZA
         #VAL LOSS SE CALCULA SOBRE LOS PACIENTES DE VALIDACIÓN (NO LOS DE TEST TODAVÍA), ENTONCES NO TIENEN UNDERSAMPLING, NI POS WEIGHT,
         #NI DROPOUT. O SEA VAL LOSS ME DICE Q TAN BIEN GENERALIZÓ EN PROMEDIO FRENTE A DATOS CON LOS Q NO ENTRENÉ
         train_loss = train_one_epoch(model, train_loader, train_criterion, optimizer, device)
-        val_loss, probs, labels = evaluate(model, val_loader, val_criterion, device)
-        m = binary_metrics(
-            probs,
-            labels,
-            THRESHOLD,
-            file_ids=val_ds.file_ids,
-            local_ids=val_ds.local_ids,
-        )
-        rk = rank_metrics(probs, labels)
-        op_metrics, op_threshold = select_event_operating_point(
-            probs,
-            labels,
-            file_ids=val_ds.file_ids,
-            local_ids=val_ds.local_ids,
-            valid_files=val_ds.valid_files,
-            annotations=val_ds.annotations,
-            max_false_alarms_per_hour=MAX_FALSE_ALARMS_PER_HOUR,
-            n_within=POSITIVES_FOR_EVENT,
-            n_window=WINDOW_RANGE_FOR_EVENT,
-            min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
-            max_latency=EVENT_MAX_LATENCY,
-            thresholds=THRESHOLD_GRID,
-        )
-        #event feasible es el booleano que me indica si el modelo logró cumplir el techo de falsas alarmas por hora
-        event_feasible = op_metrics is not None
-        if not event_feasible:
-            # Se guarda un fallback explícito para que test siga siendo reproducible, pero nunca se etiqueta como clínicamente factible.
-            op_metrics, op_threshold = select_lowest_false_alarm_point(
-                probs,
-                labels,
-                file_ids=val_ds.file_ids,
-                local_ids=val_ds.local_ids,
-                valid_files=val_ds.valid_files,
-                annotations=val_ds.annotations,
-                n_within=POSITIVES_FOR_EVENT,
-                n_window=WINDOW_RANGE_FOR_EVENT,
-                min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
-                max_latency=EVENT_MAX_LATENCY,
+
+        should_stop = False
+        #entro acá solo en el entrenamiento de los folds
+        if has_val:
+            #evalúo el modelo con los pacientes de validacion. probs= lo q predijo el modelo, labels=las rta correctas
+            val_loss, probs, labels = evaluate(model, val_loader, val_criterion, device)
+            #m= métricas de clasificación binaria (sensibilidad, especificidad, FPR, FP/h, accuracy) usando el umbral fijo THRESHOLD
+            #rk son AUPRC y AUC-ROC, y select event operating point devuelve el umbral q me cumple con el límite de falsas alarmas
+            m = binary_metrics(probs, labels, THRESHOLD, file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,)
+            rk = rank_metrics(probs, labels)
+            op_metrics, op_threshold = select_event_operating_point(
+                probs, labels,
+                file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
+                valid_files=val_ds.valid_files, annotations=val_ds.annotations,
+                max_false_alarms_per_hour=MAX_FALSE_ALARMS_PER_HOUR,
+                n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
+                min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
                 thresholds=THRESHOLD_GRID,
             )
+            # event_feasible: el modelo cumplió el techo de falsas alarmas en esta época.
+            event_feasible = op_metrics is not None
+            if not event_feasible:
+                # Fallback explícito: nunca se etiqueta como clínicamente factible, pero se guarda para que test siga siendo reproducible.
+                op_metrics, op_threshold = select_lowest_false_alarm_point(
+                    probs, labels,
+                    file_ids=val_ds.file_ids, local_ids=val_ds.local_ids,
+                    valid_files=val_ds.valid_files, annotations=val_ds.annotations,
+                    n_within=POSITIVES_FOR_EVENT, n_window=WINDOW_RANGE_FOR_EVENT,
+                    min_alarm_interval=EVENT_MIN_ALARM_INTERVAL, max_latency=EVENT_MAX_LATENCY,
+                    thresholds=THRESHOLD_GRID,
+                )
 
-        if event_feasible:
-            auprc_for_key = rk["auprc"] if rk["auprc"] is not None else -float("inf")
-            #el orden de los campos me define la prioridad de cada criterio. Son factibilidad, sensibilidad de evento, menor cantidad de falsas alarmas, mayor auprc, menor val loss
-            selection_key = (1, op_metrics["sensibility"], -op_metrics["median_false_alarms_per_hour"], auprc_for_key, -val_loss,)
+            #defino qué checkpoint guardar según mi criterio clínico
+            if event_feasible:
+                auprc_for_key = rk["auprc"] if rk["auprc"] is not None else -float("inf")
+                # El orden de la tupla define la prioridad: factibilidad, sensibilidad de evento, menor FDR mediano, mayor AUPRC, menor val_loss.
+                selection_key = (1, op_metrics["sensibility"], -op_metrics["median_false_alarms_per_hour"], auprc_for_key, -val_loss,)
+            else:
+                selection_key = (0, -val_loss)
         else:
-            selection_key = (0, -val_loss)
+            # Modo refit, no hay métricas ni selección por época.
+            val_loss = None
+            m = None
+            rk = None
+            op_metrics = None
+            op_threshold = fixed_op_threshold
+            event_feasible = False
+            selection_key = None
 
         elapsed_time_for_epoch = time.time() - t_epoch
         peak_ram = max(peak_ram, peak_ram_mb())
-        print(f"{epoch:>3} | {train_loss:>12.6f} | {val_loss:>12.6f} | "
-              f"{m['sensibility']:>10.4f} | {m['specificity']:>10.4f} | {m['false_positive_rate']:>10.4f} | "
-              f"{m['false_positive_per_hour']:>10.4f} | {m['accuracy']:>10.4f} | {elapsed_time_for_epoch:>7.1f}s")
+        if has_val:
+            print(f"{epoch:>3} | {train_loss:>12.6f} | {val_loss:>12.6f} | "
+                  f"{m['sensibility']:>10.4f} | {m['specificity']:>10.4f} | {m['false_positive_rate']:>10.4f} | "
+                  f"{m['false_positive_per_hour']:>10.4f} | {m['accuracy']:>10.4f} | {elapsed_time_for_epoch:>7.1f}s")
+        else:
+            print(f"{epoch:>3} | {train_loss:>12.6f} | {'—':>12} | {'—':>10} | {'—':>10} | "
+              f"{'—':>10} | {'—':>10} | {'—':>10} | {elapsed_time_for_epoch:>7.1f}s")
 
         history.append({
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "sensibility": m["sensibility"],
-            "specificity": m["specificity"],
-            "false_positive_rate": m["false_positive_rate"],
-            "false_positive_per_hour": m["false_positive_per_hour"],
-            "accuracy": m["accuracy"],
-            "val_auc_roc": rk["auc_roc"],
-            "val_auprc": rk["auprc"],
+            "sensibility": m["sensibility"] if m is not None else None,
+            "specificity": m["specificity"] if m is not None else None,
+            "false_positive_rate": m["false_positive_rate"] if m is not None else None,
+            "false_positive_per_hour": m["false_positive_per_hour"] if m is not None else None,
+            "accuracy": m["accuracy"] if m is not None else None,
+            "val_auc_roc": rk["auc_roc"] if rk is not None else None,
+            "val_auprc": rk["auprc"] if rk is not None else None,
             "event_threshold": op_threshold,
             "event_sensibility": op_metrics["sensibility"] if op_metrics is not None else None,
             "event_false_alarms_per_hour": (
@@ -517,37 +587,90 @@ def main() -> None:
             "time_s": elapsed_time_for_epoch,
         })
 
-        # Early stopping independiente de la elección del checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_left = args.patience
-        else:
-            patience_left -= 1
-        stop_after_epoch = patience_left <= 0
+        if has_val:
+            # Early stopping independiente de la elección del checkpoint.
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_left = patience
+            else:
+                patience_left -= 1
+            should_stop = patience_left <= 0
 
-        # Guardo el checkpoint que maximiza el objetivo clínico de validación
-        if best_selection_key is None or selection_key > best_selection_key:
-            best_selection_key = selection_key
-            best_epoch = epoch
-            best_op_threshold = op_threshold
-            best_op_metrics = op_metrics
-            best_epoch_time_s = time.time() - start
-            best_selection_metric = "event_validation" if event_feasible else "val_loss_fallback"
-            save_checkpoint(Path(args.out), model, scaler_stats, split=split, epoch=epoch, best_val_loss=best_val_loss, checkpoint_val_loss=val_loss,
-                pos_weight=pos_weight, seed=args.seed, event_config=event_config, op_threshold=op_threshold, op_metrics=op_metrics,
-                event_feasible=event_feasible, validation_auprc=rk["auprc"], selection_metric=best_selection_metric, training_config=training_config,
-                loss=args.loss, focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha)
-            print(
-                f"    -> mejor checkpoint clínico: época={epoch}, "
-                f"threshold={op_threshold if op_threshold is not None else 'N/A'}, "
-                f"val_auprc={rk['auprc'] if rk['auprc'] is not None else 'N/A'}"
-            )
+            # Se guarda el checkpoint que maximiza el objetivo clínico de validación.
+            if best_selection_key is None or selection_key > best_selection_key:
+                best_selection_key = selection_key
+                best_epoch = epoch
+                best_op_threshold = op_threshold
+                best_op_metrics = op_metrics
+                best_epoch_time_s = elapsed_before_resume + time.time() - start
+                best_selection_metric = "event_validation" if event_feasible else "val_loss_fallback"
+                save_checkpoint(out, model, scaler_stats, split=split, epoch=epoch, best_val_loss=best_val_loss, checkpoint_val_loss=val_loss,
+                    pos_weight=pos_weight, seed=seed, event_config=event_config, op_threshold=op_threshold, op_metrics=op_metrics,
+                    event_feasible=event_feasible, validation_auprc=rk["auprc"], selection_metric=best_selection_metric, training_config=training_config,
+                    loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha)
+                print(
+                    f"    -> mejor checkpoint clínico: época={epoch}, "
+                    f"threshold={op_threshold if op_threshold is not None else 'N/A'}, "
+                    f"val_auprc={rk['auprc'] if rk['auprc'] is not None else 'N/A'}"
+                )
 
-        if stop_after_epoch:
-            print(f"Early stopping: val_loss no mejoró en {args.patience} épocas. Cortando.")
+        training_complete = should_stop or epoch >= epochs
+        if resume: #guardo un estado de reanudación para poder continuar el entrenamiento si se interrumpe. contiene los pesos del modelo al final de la época
+            if not has_val:
+                best_epoch_time_s = elapsed_before_resume + time.time() - start
+            _save_resume_state(resume_path, {
+                "format_version": 2,
+                "config": {
+                    "split_id": current_split_id,
+                    "scaler_id": scaler_id(scaler_stats),
+                    "loss": loss,
+                    "focal_alpha": focal_alpha,
+                    "focal_gamma": focal_gamma,
+                    "training_config": training_config,
+                    "seed": seed,
+                    "fixed_op_threshold": fixed_op_threshold,
+                },
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+                "training_complete": training_complete,
+                "best_val_loss": best_val_loss,
+                "best_selection_key": best_selection_key,
+                "best_epoch": best_epoch,
+                "best_op_threshold": best_op_threshold,
+                "best_op_metrics": best_op_metrics,
+                "best_selection_metric": best_selection_metric,
+                "best_epoch_time_s": best_epoch_time_s,
+                "elapsed_seconds": elapsed_before_resume + time.time() - start,
+                "patience_left": patience_left,
+                "history": history,
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": np.random.get_state(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_states": (
+                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                ),
+                "train_rng_state": train_loader.dataset.rng.bit_generator.state,
+                "noise_rng_state": train_loader.dataset.noise_rng.bit_generator.state,
+            })
+        if should_stop:
+            print(f"Early stopping: val_loss no mejoró en {patience} épocas. Cortando.")
             break
 
-    total_time = time.time() - start
+    # Modo refit: guardar la última época como checkpoint final
+    if not has_val:
+        best_epoch = epoch
+        best_op_threshold = fixed_op_threshold
+        best_selection_metric = "refit_fixed_epochs"
+        if best_epoch_time_s is None:
+            best_epoch_time_s = elapsed_before_resume + time.time() - start
+        save_checkpoint(out, model, scaler_stats, split=split, epoch=best_epoch, best_val_loss=best_val_loss,
+            checkpoint_val_loss=None, pos_weight=pos_weight, seed=seed, event_config=event_config,
+            op_threshold=fixed_op_threshold, op_metrics=None, event_feasible=False, validation_auprc=None,
+            selection_metric=best_selection_metric, training_config=training_config,
+            loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha)
+
+    total_time = elapsed_before_resume + time.time() - start
 
     # Resumen de cómputo
     sample_input = torch.randn(1, N_CHANNELS, WIN_SAMPLES)
@@ -570,7 +693,7 @@ def main() -> None:
             "inference_ms_per_window_p95": latency_info["ms_per_window_p95"],
             "seconds_per_hour_of_eeg": latency_info["seconds_per_hour_of_eeg"],
             "train": {
-                "batch_size": args.batch_size,
+                "batch_size": batch_size,
                 "epochs_run": epoch,
                 "best_epoch": best_epoch,
                 "total_min_total": total_time / 60.0,
@@ -584,14 +707,14 @@ def main() -> None:
     print(f"Mejor época clínica: {best_epoch}  | criterio: {best_selection_metric}")
     print(f"Threshold operativo guardado: {best_op_threshold if best_op_threshold is not None else 'N/A'}")
     print(f"Tiempo total: {total_time / 60:.1f} min")
-    print(f"Checkpoint: {args.out}")
+    print(f"Checkpoint: {out}")
     print(f"[computo] RAM pico={peak_ram:.0f} MB  "
-          f"VRAM pico={peak_vram_mb if peak_vram_mb is not None else 'N/A'}  "
-          f"latencia={latency_info['ms_per_window_mean']:.2f} ms/ventana  "
-          f"({latency_info['seconds_per_hour_of_eeg']:.1f} s por hora de EEG)")
+        f"VRAM pico={peak_vram_mb if peak_vram_mb is not None else 'N/A'}  "
+        f"latencia={latency_info['ms_per_window_mean']:.2f} ms/ventana  "
+        f"({latency_info['seconds_per_hour_of_eeg']:.1f} s por hora de EEG)")
 
-    # Guarda el historial por época
-    history_path = Path(args.out).with_name(Path(args.out).stem + ".history.json")
+    # Guarda el historial por época (junto al checkpoint, misma base de nombre).
+    history_path = out.with_name(out.stem + ".history.json")
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history_path.write_text(json.dumps({
         "history": history,
@@ -604,14 +727,66 @@ def main() -> None:
         "training_config": training_config,
         "threshold_grid": [float(t) for t in THRESHOLD_GRID],
         "pos_weight": pos_weight,
-        "loss": args.loss,
-        "focal_gamma": args.focal_gamma,
-        "focal_alpha": args.focal_alpha,
+        "loss": loss,
+        "focal_gamma": focal_gamma,
+        "focal_alpha": focal_alpha,
         "compute": compute,
-        "seed": args.seed,
+        "seed": seed,
     }, indent=2), encoding="utf-8")
     print(f"Historial de entrenamiento: {history_path}")
 
+    return {
+        "out": str(out),
+        "device": device,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "best_selection_metric": best_selection_metric,
+        "op_threshold": best_op_threshold,
+        "op_metrics": best_op_metrics,
+        "history": history,
+        "history_path": str(history_path),
+        "compute": compute,
+        "total_min_total": total_time / 60.0,
+    }
+
+
+# def main() -> None:
+#     """CLI histórico para entrenar sin validación cruzada."""
+#     args = parse_args()
+#     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+#     scaler_stats = load_scaler_stats(Path(args.scaler_stats))
+#     if scaler_stats is None:
+#         sys.exit("No existe scaler_stats.npz. Corré primero preprocessing.")
+#     try:
+#         train_model(
+#             data_dir=args.data_dir,
+#             split=split,
+#             scaler_stats=scaler_stats,
+#             out=Path(args.out),
+#             device=args.device,
+#             loss=args.loss,
+#             focal_alpha=args.focal_alpha,
+#             focal_gamma=args.focal_gamma,
+#             batch_size=args.batch_size,
+#             lr=args.lr,
+#             weight_decay=args.weight_decay,
+#             epochs=args.epochs,
+#             patience=args.patience,
+#             neg_pos_ratio=args.neg_pos_ratio,
+#             noise_std=args.noise_std,
+#             num_workers=args.num_workers,
+#             seed=args.seed,
+#             limit_files=args.limit_files,
+#         )
+#     except RuntimeError as exc:
+#         sys.exit(str(exc))
+#
+# if __name__ == "__main__":
+#     main()
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "El entrenamiento individual está desactivado. Ejecutá la validación "
+        "cruzada con `python -m src.cv`."
+    )
