@@ -16,7 +16,7 @@ Inspeccionar visualmente un registro de electroencefalograma (EEG) es una tarea 
 
 El enfoque elegido es una red neuronal convolucional 1D (CNN-1D) que opera directamente sobre la señal cruda filtrada, sin necesidad de transformaciones manuales a otros dominios. El sistema se entrena con aprendizaje supervisado y evalúa su desempeño con métricas clínicas de detección de crisis (sensibilidad, falsas alarmas por hora y latencia de detección), no solo con accuracy.
 
-El resultado principal es que la CNN-1D alcanza una sensibilidad de crisis del 67,6 % (23 de 34 crisis detectadas) sobre pacientes no vistos, con un AUPRC de 0,39, superando de forma consistente a los baselines clásicos (el clasificador mayoritario y modelos de machine learning sobre potencia por banda). El modelo es un primer MVP de apoyo a la decisión, todavía por debajo de los objetivos clínicos de sensibilidad y de tasa de falsas alarmas.
+El resultado principal es que la CNN-1D supera de forma consistente a los baselines clásicos (regresión logística y SVM lineal sobre potencia por banda): el refit validado por CV alcanza un AUPRC de 0,40 y un AUC-ROC de 0,86 sobre pacientes no vistos, y respeta el techo de 1 falsa alarma por hora (mediana 0,61/h), aunque la sensibilidad de crisis (55,9 %, 19 de 34) está por debajo del objetivo clínico de ≥90 %. El modelo es un primer MVP de apoyo a la decisión.
 
 ### Contexto académico
 
@@ -70,29 +70,28 @@ Las señales EEG son continuas, no estacionarias y con fuerte desbalance entre c
 - Balanceo mediante submuestreo de la clase mayoritaria (`NEG_POS_RATIO = 3`) y augmentación con ruido gaussiano solo en ventanas de crisis.
 
 ### Modelo(s)
-TODO: CAMBIAR ESTO PQ ABAJO HABLA DE SPLIT FIJO
-Se entrenó una CNN-1D de 6 bloques (Conv1d + BatchNorm + ReLU + MaxPool) seguidos de Global Average Pooling y una capa densa. Se compararon dos funciones de pérdida:
+Se entrenó una CNN-1D de 6 bloques (Conv1d + BatchNorm + ReLU + MaxPool) seguidos de Global Average Pooling y una capa densa. Se compararon dos funciones de pérdida (BCE con pos_weight y Focal Loss) en tres configuraciones (`bce`, `focal_a025` y `focal_a075`).
 
-| Configuración | Pérdida | AUPRC (val) | Sens. evento (val) | Falsas alarmas/h (mediana, val) |
-|---|---|---|---|---|
-| BCE (baseline del entrenamiento) | BCE con `pos_weight` | 0,52 | 0,811 (30/37) | 0,42 |
-| Focal `alpha=0.25` | Focal Loss (Lin et al.) | 0,55 | 0,838 (31/37) | 0,42 |
-| Focal `alpha=0.75` | Focal Loss | 0,58 | 0,757 (28/37) | 0,20 |
+La Focal Loss pondera menos los ejemplos fáciles y enfoca el entrenamiento en las crisis cortas y los falsos positivos, que son los casos difíciles. La comparación entre configuraciones se realiza por validación cruzada agrupada por paciente, y `focal_a025` resulta ganadora por la mediana de AUPRC.
 
-La Focal Loss pondera menos los ejemplos fáciles y enfoca el entrenamiento en las crisis cortas y los falsos positivos, que son los casos difíciles.
-El checkpoint se elige por el *punto de operación clínico* (máxima sensibilidad de evento sujeta a una mediana de falsas alarmas ≤ 1/h por paciente), no por AUPRC, el cual se usa para desempatar. En validación, `alpha=0.75` ordena mejor (AUPRC 0,58) y dispara menos falsas alarmas, pero detecta ~3 crisis menos (28/37 vs 31/37), y el objetivo prioriza no perder crisis.
-
-Validación: split inter-paciente fijo (train/val/test, sin mezclar ventanas del mismo paciente entre particiones) para evitar fuga de datos. El punto de operación (umbral) se elige en validación maximizando la sensibilidad de crisis sujeta a un techo de falsas alarmas (mediana ≤ 1/h por paciente), con postprocesado a nivel de evento (≥2 positivas en 3 ventanas consecutivas, intervalo mínimo de 4 min entre alarmas).
+Validación: validación cruzada agrupada por paciente (5 folds, `StratifiedGroupKFold`) sobre el pool de desarrollo, con el conjunto de test congelado aparte y sin mezclar ventanas del mismo paciente entre particiones, para evitar fuga de datos. El punto de operación (umbral) se elige en validación maximizando la sensibilidad de crisis sujeta a un techo de falsas alarmas (mediana ≤ 1/h por paciente), con postprocesado a nivel de evento (≥2 positivas en 3 ventanas consecutivas, intervalo mínimo de 4 min entre alarmas).
 
 ### Validación cruzada de desarrollo
 
-Se implementó una validación cruzada agrupada por paciente para evaluar las configuraciones de entrenamiento sobre distintas particiones del dataset de desarrollo (train y val, 18 pacientes). Los datos se dividen en K folds, y en cada iteración se entrena el modelo con los pacientes de (K−1) folds y se evalúa con los pacientes del fold restante. Cada fold produce una medida de desempeño y los resultados se resumen mediante la media y el desvío estándar.
+Se implementó una validación cruzada agrupada por paciente para evaluar las configuraciones de entrenamiento sobre distintas particiones del dataset de desarrollo (train y val, 18 pacientes). Los datos se dividen en K folds, y en cada iteración se entrena el modelo con los pacientes de (K−1) folds y se evalúa con los pacientes del fold restante. Cada fold produce una medida de desempeño y los resultados se resumen mediante la mediana y el rango intercuartílico (IQR), más robustos al sesgo de los folds difíciles que la media ± desvío.
 
 La partición se realiza por paciente, no por ventana, para mantener todas las ventanas de cada paciente en un mismo grupo. Se utiliza StratifiedGroupKFold con K=5 y estratificación por severidad de crisis. Los 18 pacientes del pool de desarrollo rotan y aparecen una vez cada uno en validación. El conjunto de test del split fijo se mantiene separado durante la validación cruzada.
 
-En cada fold, las estadísticas del RobustScaler se calculan únicamente con los pacientes de entrenamiento de ese fold. Se comparan las configuraciones `bce`, `focal_a025` y `focal_a075`, manteniendo constantes los demás parámetros del entrenamiento. Para cada configuración se ejecutan cinco entrenamientos, uno por fold, y se reportan AUPRC, AUC-ROC, métricas por ventana y por evento, falsas alarmas por hora y latencia, agregadas entre folds.
+En cada fold, las estadísticas del RobustScaler se calculan únicamente con los pacientes de entrenamiento de ese fold. Se comparan las configuraciones `bce`, `focal_a025` y `focal_a075`, manteniendo constantes los demás parámetros del entrenamiento. Para cada configuración se ejecutan cinco entrenamientos, uno por fold, y se reportan AUPRC, AUC-ROC, sensibilidad de evento y falsas alarmas por hora, agregadas entre folds.
 
-La configuración se selecciona según la media de AUPRC de validación; en caso de empate, se prefiere la de menor desvío estándar. Luego se reentrena esa configuración con todo el pool de desarrollo y se evalúa una vez sobre el conjunto de test.
+| Configuración | AUPRC (mediana, IQR) | AUC-ROC (mediana, IQR) | Sens. evento (pooled) | FA/h mediana (mediana, IQR) |
+|---|---|---|---|---|
+| `bce` | 0,118 (0,011–0,271) | 0,842 (0,822–0,918) | 48,2 % (79/164) | 0,787 (0,474–0,922) |
+| `focal_a025` | 0,138 (0,037–0,318) | 0,874 (0,838–0,916) | 55,5 % (91/164) | 0,725 (0,642–0,798) |
+| `focal_a075` | 0,093 (0,018–0,326) | 0,874 (0,840–0,928) | 50,0 % (82/164) | 0,713 (0,410–0,756) |
+
+La configuración se selecciona según la mediana de AUPRC de validación; en caso de empate, se prefiere la de menor IQR. Luego se reentrena esa configuración con todo el pool de desarrollo y se evalúa una vez sobre el conjunto de test.
+
 ---
 
 ## Resultados y comparación contra baseline
@@ -100,31 +99,31 @@ La configuración se selecciona según la media de AUPRC de validación; en caso
 Métricas sobre el test congelado inter-paciente (6 pacientes, 34 crisis). Los baselines de comparación son dos modelos de machine learning sobre features
 de ingeniería (potencia espectral de cada ventana en las bandas canónicas del EEG), entrenados como regresión logística y SVM lineal. Se usa el mismo split inter-paciente, el mismo postprocesado de evento y el mismo criterio de punto de operación que la CNN. 
 
-| Métrica  | Regresión logística |SVM lineal | BCE | Focal α=.25 (final) |
-|----------|---------------------|-----------|-----|---------------------|
-| AUC-ROC | 0,694 | 0,710 | 0,8915 | 0,8957 |
-| AUPRC   | 0,030 | 0,064 |0,3736 | 0,3881 |
-| Sensibilidad de crisis (evento) | 26,5 % (9/34) | 17,6% (6/34) | 64,7 % (22/34) | 67,6 % (23/34) |
-| Falsas alarmas/h (mediana por paciente) | 12,55 | 0,41 | 2,05 | 2,42 |
-| Sensibilidad (ventana)                  | 0,593 | 0,189 | 67,3 % | 63,6 % |
-| Especificidad (ventana)                 | 69,6% | 99,6% | 95,7 % | 97,2 % |
-| MCC (ventana)                           | - | - | 0,139 | 0,164 |
-| Latencia media de detección | 14,9s | 17,6s |16,70 s | 15,85 s |
+`Focal α=.25 (final)` es el modelo entrenado con el split fijo train/val y punto de operación elegido en validación; `Focal α=.25 (refit CV)` es el ganador de la validación cruzada (`focal_a025`) reentrenado sobre todo el pool de desarrollo (18 pacientes) y evaluado una sola vez sobre test con umbral fijo 0,42.
 
-Focal α=.25 es superior a BCE en ranking (AUPRC y AUC) y en la mayoría de las métricas de ventana: reduce los falsos positivos (~36 % menos de FPR) y mejora MCC y F1.
-En comparación con los baselines, la CNN supera ampliamente a ambos: mejora el AUC-ROC de ~0,71 a 0,90, multiplica el AUPRC por más de 6 (0,39 vs 0,06), detecta más del doble de crisis (23/34 vs 9/34 y 6/34). El SVM lineal logra respetar el techo clínico de falsas alarmas (0,41/h) pero a costa de una sensibilidad muy baja (17,6 %).
+| Métrica  | Regresión logística | SVM lineal | BCE | Focal α=.25 (final) | Focal α=.25 (refit CV) |
+|----------|---------------------|-----------|-----|---------------------|------------------------|
+| AUC-ROC | 0,694 | 0,710 | 0,8915 | 0,8957 | 0,8606 |
+| AUPRC   | 0,030 | 0,064 | 0,3736 | 0,3881 | 0,3994 |
+| Sensibilidad de crisis (evento) | 26,5 % (9/34) | 17,6% (6/34) | 64,7 % (22/34) | 67,6 % (23/34) | 55,9 % (19/34) |
+| Falsas alarmas/h (mediana por paciente) | 12,55 | 0,41 | 2,05 | 2,42 | 0,61 |
+| Sensibilidad (ventana) | 0,593 | 0,189 | 67,3 % | 63,6 % | 50,1 % |
+| Especificidad (ventana) | 69,6 % | 99,6 % | 95,7 % | 97,2 % | 99,4 % |
+| MCC (ventana) | - | - | 0,139 | 0,164 | 0,267 |
+| Latencia media de detección | 14,9 s | 17,6 s | 16,70 s | 15,85 s | 16,32 s |
+
+Focal α=.25 es superior a BCE en ranking (AUPRC y AUC) y en la mayoría de las métricas de ventana: reduce los falsos positivos (~36 % menos de FPR) y mejora MCC.
+En comparación con los baselines, la CNN supera ampliamente a ambos: mejora el AUC-ROC de ~0,71 a 0,86, multiplica el AUPRC por más de 6 (0,39 vs 0,06), detecta más del doble de crisis (19/34 vs 9/34 y 6/34). El SVM lineal logra respetar el techo clínico de falsas alarmas (0,41/h) pero a costa de una sensibilidad muy baja (17,6 %).
 
 ### Análisis crítico
 
-El modelo es un MVP funcional que supera al baseline, pero no alcanza todavía los objetivos clínicos:
+El modelo es un MVP funcional que supera a los baselines, pero no alcanza todavía los objetivos clínicos:
 
-- La sensibilidad de crisis (67,6 %) queda lejos del objetivo de ≥90 %.
-- Las falsas alarmas (~2,4/h medianas) superan el techo clínico de 1/h.
-- Las crisis cortas siguen siendo el punto débil: en `chb16` (crisis de ~8 s) solo se
-  detectan 2 de 10 para ambos modelos. Es un problema de representación de datos, no de la
-  función de pérdida.
-- Con 34 crisis de test, la mejora de una crisis entre BCE y Focal tiene aún mucha
-  incertidumbre estadística.
+- El refit CV (`focal_a025`, umbral 0,42) es el primer modelo que respeta el techo de 1 falsa alarma/h (mediana 0,61/h), a costa de detectar menos crisis: 55,9 % (19/34) frente al 67,6 % del modelo final previo, que en test disparaba 2,42 falsas alarmas/h. Es un compromiso entre alarmas aceptables y sensibilidad, y ninguno de los dos alcanza el objetivo de ≥90 %.
+- El ranking se mantiene robusto: AUPRC 0,399 (el mejor de todos los modelos) y AUC-ROC 0,861, muy por encima de los baselines (0,71 y 0,06).
+- La variabilidad entre pacientes es extrema: `chb20` (8/8) y `chb09` (4/4) se detectan por completo, mientras que `chb16` (2/10), `chb18` (2/6) y `chb17` (1/3) quedan muy por debajo. Las crisis cortas (`chb16`, ~8 s) siguen siendo el punto débil, y es un problema de representación de datos, no de la función de pérdida.
+- `chb09` es el único paciente que excede el techo de falsas alarmas (1,59/h) pese a detectar todas sus crisis, lo que confirma que el desglose por paciente importa tanto como el agregado.
+- Con 34 crisis de test, la diferencia entre configuraciones sigue teniendo mucha incertidumbre estadística.
 
 ---
 
@@ -133,6 +132,7 @@ El modelo es un MVP funcional que supera al baseline, pero no alcanza todavía l
 ```text
 .
 ├── README.md
+├── docs/                  # sitio de documentación y resultados para GitHub Pages
 ├── pyproject.toml
 ├── LICENSE
 ├── INFORME_TECNICO.pdf    # informe técnico del trabajo
@@ -148,6 +148,21 @@ El modelo es un MVP funcional que supera al baseline, pero no alcanza todavía l
 ├── inferences/            # reportes JSON de inferencia (ejemplos)
 └── tests/                 # tests de unidad (pytest)
 ```
+
+---
+
+## Publicación en GitHub Pages
+
+El sitio estático con la documentación y los resultados del proyecto se encuentra en
+[`docs/`](docs/). El workflow de GitHub Actions lo publica al hacer push a `main`.
+
+Para habilitarlo en el repositorio, ir a **Settings → Pages** y seleccionar **GitHub
+Actions** como fuente de publicación. Una vez que termine el workflow
+**Deploy project site to GitHub Pages**, el sitio estará disponible en
+`https://agostinaperez.github.io/ia-final/`.
+
+GitHub Pages publica esta documentación estática; no ejecuta FastAPI ni la inferencia
+del modelo. La demo interactiva descrita abajo requiere un backend Python en ejecución.
 
 ---
 
@@ -254,6 +269,11 @@ repositorio.
 
 ## Referencias
 
+- LeCun, Y., Bottou, L., Bengio, Y. & Haffner, P. (1998). Gradient-Based Learning Applied
+  to Document Recognition. *Proceedings of the IEEE*, 86(11), 2278–2324.
+  http://yann.lecun.com/exdb/publis/pdf/lecun-98b.pdf
+- Goodfellow, I., Bengio, Y. & Courville, A. (2016). *Deep Learning*. MIT Press.
+  https://www.deeplearningbook.org/
 - Goldberger, A. et al. PhysioBank, PhysioToolkit, and PhysioNet. *Circulation*, 2000.
 - Shoeb, A. *Application of Machine Learning to Epileptic Seizure Onset Detection and
   Treatment*. PhD thesis, MIT, 2009.

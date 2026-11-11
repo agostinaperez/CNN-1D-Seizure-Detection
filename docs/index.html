@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Proyecto académico de detección automática de crisis epilépticas en EEG mediante una CNN-1D. Metodología y resultados sobre CHB-MIT.">
+    <meta name="theme-color" content="#101a1c">
+    <title>Detección de crisis epilépticas en EEG · CNN-1D</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101a1c;
+        --surface: #172426;
+        --surface-raised: #1d2d2f;
+        --text: #edf4f1;
+        --muted: #b0c1bb;
+        --line: #304548;
+        --accent: #82d3b0;
+        --accent-strong: #b0f0d2;
+        --warm: #f3c985;
+        --width: 1100px;
+      }
+
+      * { box-sizing: border-box; }
+
+      html { scroll-behavior: smooth; }
+
+      body {
+        margin: 0;
+        background:
+          radial-gradient(ellipse at 75% 0%, rgb(56 109 96 / 22%), transparent 34rem),
+          var(--bg);
+        color: var(--text);
+        font: 16px/1.7 "Segoe UI", system-ui, -apple-system, sans-serif;
+      }
+
+      a { color: var(--accent-strong); }
+      a:hover { color: #fff; }
+      a:focus-visible { outline: 3px solid var(--warm); outline-offset: 4px; }
+
+      .wrap { width: min(var(--width), calc(100% - 2.5rem)); margin-inline: auto; }
+
+      .skip-link {
+        position: absolute;
+        top: -4rem;
+        left: 1rem;
+        z-index: 5;
+        padding: .6rem 1rem;
+        background: var(--text);
+        color: var(--bg);
+      }
+      .skip-link:focus { top: 1rem; }
+
+      header { border-bottom: 1px solid var(--line); }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1.5rem;
+        min-height: 68px;
+      }
+
+      .brand { color: var(--text); font-weight: 700; text-decoration: none; }
+      nav { display: flex; flex-wrap: wrap; gap: .35rem 1.1rem; }
+      nav a { color: var(--muted); font-size: .9rem; text-decoration: none; }
+      nav a:hover { color: var(--accent-strong); }
+
+      .hero { padding: clamp(4rem, 10vw, 7rem) 0 4rem; }
+      .eyebrow {
+        color: var(--accent);
+        font-size: .78rem;
+        font-weight: 750;
+        letter-spacing: .14em;
+        text-transform: uppercase;
+      }
+
+      h1, h2, h3 { line-height: 1.2; }
+      h1 { max-width: 850px; margin: .8rem 0 1rem; font-size: clamp(2.4rem, 6vw, 4.7rem); letter-spacing: -.045em; }
+      h2 { margin: 0 0 1.2rem; font-size: clamp(1.7rem, 4vw, 2.5rem); letter-spacing: -.025em; }
+      h3 { margin: 0 0 .55rem; font-size: 1.15rem; }
+      p { margin: .7rem 0 1rem; }
+      .lead { max-width: 760px; color: var(--muted); font-size: clamp(1.08rem, 2vw, 1.3rem); }
+
+      .hero-meta { margin-top: 1.8rem; color: var(--muted); font-size: .95rem; }
+      .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.8rem; }
+      .button {
+        display: inline-block;
+        padding: .7rem 1rem;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--text);
+        font-size: .92rem;
+        font-weight: 650;
+        text-decoration: none;
+      }
+      .button.primary { border-color: var(--accent); background: var(--accent); color: #10211c; }
+      .button:hover { border-color: var(--accent-strong); }
+
+      section { padding: 4rem 0; border-top: 1px solid var(--line); scroll-margin-top: 1rem; }
+      .section-intro { max-width: 770px; margin: -.25rem 0 1.8rem; color: var(--muted); }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+      .card {
+        padding: 1.35rem;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: linear-gradient(145deg, rgb(255 255 255 / 3%), transparent 65%), var(--surface);
+      }
+      .card p:last-child { margin-bottom: 0; }
+      .card .eyebrow { margin-bottom: .6rem; }
+      .wide { grid-column: 1 / -1; }
+
+      .pipeline {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: .65rem;
+        margin-top: 1.5rem;
+      }
+      .step {
+        min-height: 116px;
+        padding: 1rem;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+      }
+      .step b { display: block; margin-bottom: .35rem; color: var(--accent); }
+      .step span { color: var(--muted); font-size: .9rem; }
+
+      .stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .8rem; margin: 1.7rem 0; }
+      .stat { padding: 1.2rem; border-left: 3px solid var(--accent); background: var(--surface); }
+      .stat strong { display: block; color: var(--accent-strong); font-size: clamp(1.65rem, 4vw, 2.45rem); line-height: 1.1; }
+      .stat span { display: block; margin-top: .55rem; color: var(--muted); font-size: .88rem; }
+
+      .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+      table { width: 100%; border-collapse: collapse; background: var(--surface); font-size: .93rem; }
+      caption { padding: 1rem; color: var(--muted); text-align: left; }
+      th, td { padding: .78rem .9rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+      th { color: var(--accent-strong); font-size: .85rem; }
+      tbody tr:last-child td { border-bottom: 0; }
+      tbody tr.highlight { background: rgb(130 211 176 / 8%); }
+      td:not(:first-child), th:not(:first-child) { white-space: nowrap; }
+
+      .callout {
+        margin-top: 1.2rem;
+        padding: 1rem 1.2rem;
+        border-left: 3px solid var(--warm);
+        background: rgb(243 201 133 / 8%);
+        color: var(--muted);
+      }
+      .callout strong { color: var(--text); }
+
+      .tag-list { display: flex; flex-wrap: wrap; gap: .5rem; padding: 0; list-style: none; }
+      .tag-list li { padding: .3rem .7rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .85rem; }
+
+      footer { padding: 2rem 0 3rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
+      footer p { margin: .3rem 0; }
+
+      @media (max-width: 760px) {
+        .topbar { align-items: flex-start; flex-direction: column; justify-content: center; padding: 1rem 0; }
+        nav { gap: .45rem .9rem; }
+        .grid { grid-template-columns: 1fr; }
+        .wide { grid-column: auto; }
+        .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .pipeline .step:last-child { grid-column: 1 / -1; }
+        .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+
+      @media (max-width: 420px) {
+        .wrap { width: min(100% - 1.5rem, var(--width)); }
+        .pipeline { grid-template-columns: 1fr; }
+        .pipeline .step:last-child { grid-column: auto; }
+        .stat-grid { grid-template-columns: 1fr 1fr; }
+        th, td { padding: .65rem; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#contenido">Saltar al contenido</a>
+    <header>
+      <div class="wrap topbar">
+        <a class="brand" href="#inicio">EEG · CNN-1D</a>
+        <nav aria-label="Navegación principal">
+          <a href="#problema">Proyecto</a>
+          <a href="#metodologia">Metodología</a>
+          <a href="#resultados">Resultados</a>
+          <a href="#limitaciones">Limitaciones</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="contenido">
+      <div class="wrap">
+        <section class="hero" id="inicio" style="border-top: 0">
+          <div class="eyebrow">Proyecto funcional · Inteligencia Artificial · 2026</div>
+          <h1>Detección automática de crisis epilépticas en señales EEG</h1>
+          <p class="lead">Una red neuronal convolucional 1D (CNN-1D) clasifica ventanas de EEG como actividad ictal o basal y busca facilitar la revisión de registros prolongados.</p>
+          <p class="hero-meta">Agostina Pérez · Instituto Universitario Aeronáutico · Docente: Gonzalez, Hernando Alexis</p>
+          <div class="actions">
+            <a class="button primary" href="https://github.com/agostinaperez/ia-final">Ver código en GitHub</a>
+            <a class="button" href="INFORME_TECNICO.pdf">Leer informe técnico (PDF)</a>
+          </div>
+        </section>
+
+        <section id="problema">
+          <div class="eyebrow">01 · Problema y objetivo</div>
+          <h2>¿Qué busca resolver?</h2>
+          <p class="section-intro">La revisión visual de un monitoreo EEG continuo puede implicar muchas horas de señal y es una tarea demandante. El proyecto explora un sistema supervisado que analice registros pregrabados y señale ventanas que podrían corresponder a una crisis.</p>
+          <div class="grid">
+            <article class="card">
+              <h3>Entrada y salida</h3>
+              <p>El sistema procesa archivos EEG en formato EDF. Para cada ventana genera una probabilidad de crisis; un umbral la convierte en una predicción de crisis o no crisis. Las ventanas se agrupan luego para evaluar episodios completos.</p>
+            </article>
+            <article class="card">
+              <h3>Uso previsto</h3>
+              <p>Es un prototipo académico de apoyo a la decisión, no una herramienta diagnóstica ni un dispositivo clínico validado. La decisión final requiere revisión profesional.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="datos">
+          <div class="eyebrow">02 · Datos</div>
+          <h2>CHB-MIT Scalp EEG Database</h2>
+          <p class="section-intro">Se trabaja con una base pública de EEG pediátrico continuo, anotada con intervalos de crisis. El conjunto crudo no se redistribuye en este repositorio; está disponible para investigación mediante PhysioNet.</p>
+          <div class="grid">
+            <article class="card">
+              <h3>Características utilizadas</h3>
+              <ul>
+                <li>Frecuencia de muestreo: 256 Hz.</li>
+                <li>16 canales bipolares en un montaje canónico.</li>
+                <li>Ventanas de 5,12 s con 50 % de solapamiento.</li>
+                <li>Etiquetas derivadas de los tiempos de inicio y fin anotados.</li>
+              </ul>
+            </article>
+            <article class="card">
+              <h3>Partición inter-paciente</h3>
+              <p>La separación se realiza por paciente, no por ventana, para que registros de una misma persona no aparezcan a la vez en entrenamiento y evaluación. El test fijo queda apartado de las decisiones de entrenamiento.</p>
+              <p><a href="https://physionet.org/content/chbmit/1.0.0/">Consultar el dataset en PhysioNet</a></p>
+            </article>
+          </div>
+        </section>
+
+        <section id="metodologia">
+          <div class="eyebrow">03 · Metodología</div>
+          <h2>Del registro a la evaluación</h2>
+          <p class="section-intro">El procesamiento conserva el orden temporal de la señal y calcula las estadísticas de normalización únicamente con los datos de entrenamiento para reducir la fuga de información.</p>
+          <div class="pipeline" aria-label="Etapas del procesamiento">
+            <div class="step"><b>01 · Preparar</b><span>Seleccionar y alinear los 16 canales.</span></div>
+            <div class="step"><b>02 · Filtrar</b><span>Pasa-banda de 0,5 a 50 Hz.</span></div>
+            <div class="step"><b>03 · Ventanear</b><span>Ventanas de 5,12 s; solapamiento del 50 %.</span></div>
+            <div class="step"><b>04 · Clasificar</b><span>CNN-1D estima probabilidad de crisis.</span></div>
+            <div class="step"><b>05 · Evaluar</b><span>Umbral y métricas por ventana y por evento.</span></div>
+          </div>
+          <div class="grid" style="margin-top: 1rem">
+            <article class="card">
+              <h3>Modelo y entrenamiento</h3>
+              <p>La arquitectura SeizureCNN apila seis bloques convolucionales 1D y una capa clasificadora. Se usa AdamW y se comparan BCE con peso para la clase positiva y Focal Loss, que ayudan a abordar el desbalance entre ventanas con y sin crisis.</p>
+            </article>
+            <article class="card">
+              <h3>Validación y selección</h3>
+              <p>Se utiliza validación cruzada agrupada por paciente en cinco folds sobre el conjunto de desarrollo. La configuración se selecciona por la mediana de AUPRC (desempate por menor IQR); la ganadora se reentrena sobre todo el pool de desarrollo y se evalúa una sola vez sobre test con umbral fijo.</p>
+            </article>
+            <article class="card wide">
+              <h3>Métricas relevantes</h3>
+              <ul class="tag-list" aria-label="Métricas reportadas">
+                <li>Sensibilidad de evento</li>
+                <li>Falsas alarmas por hora</li>
+                <li>Latencia</li>
+                <li>AUPRC</li>
+                <li>AUC-ROC</li>
+                <li>Métricas por ventana</li>
+              </ul>
+              <p>La sensibilidad de evento indica qué proporción de las crisis completas se detectó. AUPRC mide el equilibrio entre precisión y sensibilidad y es informativa cuando las clases están muy desbalanceadas. Las falsas alarmas por hora y la latencia complementan las métricas de clasificación con aspectos temporales de la detección.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="resultados">
+          <div class="eyebrow">04 · Resultados</div>
+          <h2>Evaluación en pacientes no vistos</h2>
+          <p class="section-intro">Resultados sobre el conjunto de test inter-paciente congelado: 6 pacientes y 34 crisis. La tabla compara dos baselines clásicos con tres variantes de la CNN (BCE, Focal α=0,25 y su refit por validación cruzada), usando el mismo split y el mismo postprocesamiento de eventos.</p>
+
+          <div class="stat-grid" aria-label="Resultados destacados de CNN Focal alpha 0,25 refit CV">
+            <div class="stat"><strong>55,9 %</strong><span>de sensibilidad de evento · 19 de 34 crisis</span></div>
+            <div class="stat"><strong>0,399</strong><span>AUPRC sobre test</span></div>
+            <div class="stat"><strong>0,861</strong><span>AUC-ROC sobre test</span></div>
+            <div class="stat"><strong>0,61 /h</strong><span>mediana de falsas alarmas · bajo el techo de 1/h</span></div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <caption>Métricas reportadas sobre el test. La sensibilidad y las falsas alarmas principales corresponden a nivel de evento. El refit CV reentrena la configuración ganadora de la validación cruzada sobre el pool de desarrollo completo y evalúa test una sola vez con umbral fijo (0,42).</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Métrica</th>
+                  <th scope="col">Regresión logística</th>
+                  <th scope="col">SVM lineal</th>
+                  <th scope="col">CNN · Focal α=0,25 (refit CV)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><th scope="row">AUC-ROC</th><td>0,694</td><td>0,710</td><td>0,8606</td></tr>
+                <tr><th scope="row">AUPRC</th><td>0,030</td><td>0,064</td><td>0,3736</td></tr>
+                <tr class="highlight"><th scope="row">Sensibilidad de evento</th><td>26,5 % (9/34)</td><td>17,6 % (6/34)</td><td>55,9 % (19/34)</td></tr>
+                <tr><th scope="row">Falsas alarmas/h (mediana por paciente)</th><td>12,55</td><td>0,41</td><td>0,61</td></tr>
+                <tr><th scope="row">Sensibilidad por ventana</th><td>0,593</td><td>0,189</td><td>50,1 %</td></tr>
+                <tr><th scope="row">Especificidad por ventana</th><td>69,6 %</td><td>99,6 %</td><td>99,4 %</td></tr>
+                <tr><th scope="row">MCC por ventana</th><td>—</td><td>—</td><td>0,139</td></tr>
+                <tr><th scope="row">Latencia media</th><td>14,9 s</td><td>17,6 s</td><td>16,70 s</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout"><strong>Lectura principal:</strong> las CNN superan a los baselines en AUC-ROC, AUPRC y cantidad de crisis detectadas. El refit CV de Focal α=0,25 es el primer modelo que respeta el techo de 1 falsa alarma/h (mediana 0,61), aunque lo logra a costa de una menor sensibilidad (19/34 crisis frente a 23/34 del modelo final previo). El resultado es prometedor como prototipo, pero la sensibilidad todavía no alcanza el objetivo exploratorio.</div>
+        </section>
+
+        <section id="limitaciones">
+          <div class="eyebrow">05 · Discusión</div>
+          <h2>Alcance y próximos pasos</h2>
+            <article class="card">
+              <h3>Limitaciones observadas</h3>
+              <ul>
+                <li>La sensibilidad de evento del refit CV (55,9 %) queda por debajo del objetivo exploratorio de 90 %.</li>
+                <li>El refit CV respeta el techo de 1 falsa alarma/h (0,61), pero el modelo final previo (2,42/h) lo superaba: la elección del umbral fijo define el compromiso sensibilidad/alarmas.</li>
+                <li>Las crisis cortas son difíciles: en un paciente con eventos de aproximadamente 8 s, se detectaron 2 de 10.</li>
+                <li>La evaluación de test contiene 34 crisis; la diferencia entre configuraciones no permite afirmar una mejora concluyente.</li>
+              </ul>
+            </article>
+        </section>
+
+        <section id="recursos">
+          <div class="eyebrow">06 · Recursos</div>
+          <h2>Documentación y código</h2>
+          <div class="grid">
+            <article class="card">
+              <h3>Material del proyecto</h3>
+              <ul>
+                <li><a href="https://github.com/agostinaperez/ia-final">Repositorio y código fuente</a></li>
+                <li><a href="https://github.com/agostinaperez/ia-final/blob/main/README.md">README del repositorio</a></li>
+                <li><a href="INFORME_TECNICO.pdf">Informe técnico en PDF</a></li>
+              </ul>
+            </article>
+            <article class="card">
+              <h3>Referencias</h3>
+              <ul>
+                <li>LeCun, Y., Bottou, L., Bengio, Y. &amp; Haffner, P. (1998). <em>Gradient-Based Learning Applied to Document Recognition</em>. Proceedings of the IEEE, 86(11), 2278–2324. <a href="http://yann.lecun.com/exdb/publis/pdf/lecun-98b.pdf">PDF</a></li>
+                <li>Goodfellow, I., Bengio, Y. &amp; Courville, A. (2016). <em>Deep Learning</em>. MIT Press. <a href="https://www.deeplearningbook.org/">deeplearningbook.org</a></li>
+                <li><a href="https://physionet.org/content/chbmit/1.0.0/">CHB-MIT Scalp EEG Database · PhysioNet</a></li>
+                <li>Lin, T.-Y. et al. (2017). <em>Focal Loss for Dense Object Detection</em>. ICCV.</li>
+                <li>Wang, X. et al. (2025). EEG-based seizure onset detection using 1D CNN. <em>IEEE TNSRE</em>.</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p>Proyecto académico · Inteligencia Artificial · 2026</p>
+        <p>Autora: <a href="https://github.com/agostinaperez">Agostina Pérez</a> · Licencia del código: MIT.</p>
+        <p>El dataset CHB-MIT tiene sus propios términos de uso y no se redistribuye aquí.</p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -7,7 +7,7 @@ build/
 dist/
 *.egg-info/
 *.egg
-
+cv_run/
 # Virtual Environment
 .venv/
 venv/
