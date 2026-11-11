@@ -199,25 +199,25 @@ def test_aggregate_handles_none_values():
 
 
 # ---------------------------------------------------------------- selección
-def test_select_best_highest_mean():
+def test_select_best_highest_median():
     summary = {
-        "a": {"auprc": {"mean": 0.5, "std": 0.1}},
-        "b": {"auprc": {"mean": 0.6, "std": 0.2}},
+        "a": {"auprc": {"median": 0.5, "iqr": 0.1}},
+        "b": {"auprc": {"median": 0.6, "iqr": 0.2}},
     }
     assert select_best(summary, metric="auprc") == "b"
 
 
-def test_select_best_tie_breaker_lowest_std():
+def test_select_best_tie_breaker_lowest_iqr():
     summary = {
-        "b": {"auprc": {"mean": 0.6, "std": 0.2}},
-        "c": {"auprc": {"mean": 0.6, "std": 0.05}},
+        "b": {"auprc": {"median": 0.6, "iqr": 0.2}},
+        "c": {"auprc": {"median": 0.6, "iqr": 0.05}},
     }
     assert select_best(summary, metric="auprc") == "c"
 
 
 def test_select_best_ignores_missing_metrics():
     summary = {
-        "a": {"auprc": {"mean": 0.5, "std": 0.1}},
+        "a": {"auprc": {"median": 0.5, "iqr": 0.1}},
         "b": {"auprc": None},
     }
     assert select_best(summary, metric="auprc") == "a"

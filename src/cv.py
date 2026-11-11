@@ -264,9 +264,14 @@ def aggregate(fold_results: list[dict], metric_keys: list[str] | None = None) ->
         if not vals:
             agg[key] = None
             continue
+        q25, q75 = np.percentile(vals, [25, 75])
         agg[key] = {
             "mean": float(np.mean(vals)),
             "std": float(np.std(vals)),
+            "median": float(np.median(vals)),
+            "q25": float(q25),
+            "q75": float(q75),
+            "iqr": float(q75 - q25),
             "min": float(np.min(vals)),
             "max": float(np.max(vals)),
             "values": [float(v) for v in vals],
@@ -280,13 +285,13 @@ def aggregate(fold_results: list[dict], metric_keys: list[str] | None = None) ->
 
 
 def select_best(summary: dict, metric: str = "auprc") -> str:
-    """Elige la configuración con mejor media de metric, q en este caso es el auprc medio de todos los folds de esa confing.
-    Desempate: menor desvío estándar. Nunca se elige por el mejor fold individual. devuelve el nombre de la config q ganó
+    """Elige la configuración con mejor mediana de metric entre los folds de esa config.
+    Desempate: menor rango intercuartílico (IQR). Nunca se elige por el mejor fold individual. devuelve el nombre de la config q ganó
     """
     scored = [
-        (config_id, m[metric]["mean"], m[metric]["std"])
+        (config_id, m[metric]["median"], m[metric].get("iqr", float("inf")))
         for config_id, m in summary.items()
-        if m.get(metric)
+        if m.get(metric) and m[metric].get("median") is not None
     ]
     if not scored:
         raise RuntimeError(
@@ -329,6 +334,78 @@ def refit_final(config: dict, dev_patients: list[str] ,base_split: dict, *, data
         device=device,
     )
     return {"train_summary": train_summary, "test": test_res}
+
+
+def run_refit(config_id: str, *, data_dir: Path | str, split_file: Path | str = SPLIT_FILE, out_dir: Path | str = CV_OUT_DIR,
+    device: str | None = None, seed: int = CV_SEED, epochs: int | None = None, refit_threshold: float | None = None,) -> dict:
+    """Refit de una configuración sobre todo el pool de desarrollo + evaluación de test, sin reentrenar los folds.
+
+    El umbral y la cantidad de épocas se infieren de los `fold*.result.json` ya guardados de esa configuración
+    (media de umbrales y de best_epoch, igual que en `run_cv`); si se pasan `refit_threshold`/`epochs` explícitos, tienen prioridad.
+    Escribe `<out_dir>/cv_final_<config>.pt` y `<out_dir>/refit_result.json`.
+    """
+    if config_id not in CONFIG_REGISTRY:
+        raise ValueError(f"Configuración desconocida: {config_id!r}")
+
+    base_split = json.loads(Path(split_file).read_text(encoding="utf-8"))
+    dev_patients = list(base_split.get("train", [])) + list(base_split.get("val", []))
+    test_patients = list(base_split.get("test", []))
+    validate_pools(dev_patients, test_patients)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_results: list[dict] = []
+    for path in sorted((out_dir / config_id).glob("fold*.result.json")):
+        fold_results.append(json.loads(path.read_text(encoding="utf-8")))
+
+    if refit_threshold is None:
+        thresholds = [r["threshold"] for r in fold_results if r.get("threshold") is not None]
+        refit_threshold = round(float(np.mean(thresholds)), 2) if thresholds else THRESHOLD
+    if epochs is None:
+        best_epochs = [r["best_epoch"] for r in fold_results if r.get("best_epoch")]
+        epochs = max(1, int(round(np.mean(best_epochs)))) if best_epochs else EPOCHS
+
+    refit_out = out_dir / f"cv_final_{config_id}.pt"
+    print(f"\nRefit de {config_id} sobre los {len(dev_patients)} pacientes del pool "
+          f"({epochs} épocas, umbral={refit_threshold})")
+    t0 = time.time()
+    refit = refit_final(
+        CONFIG_REGISTRY[config_id], dev_patients, base_split,
+        data_dir=data_dir, out=refit_out, device=device,
+        seed=seed, epochs=epochs, refit_threshold=refit_threshold,
+    )
+    refit_result = {
+        "checkpoint": str(refit_out),
+        "epochs": epochs,
+        "threshold": refit_threshold,
+        "test": refit["test"],
+    }
+    _write_json_atomic(out_dir / "refit_result.json", refit_result)
+    refit_out.with_name(refit_out.stem + ".resume.pt").unlink(missing_ok=True)
+    print(f"Refit terminado en {time.time() - t0:.1f}s -> {refit_out}")
+
+    return {"summary": {}, "best": config_id, "refit_threshold": refit_threshold, "refit": refit_result}
+
+
+def run_select_best(*, out_dir: Path | str = CV_OUT_DIR, config_ids: list[str] | None = None) -> dict:
+    """Lee los `fold*.result.json` ya guardados, agrega y selecciona la configuración ganadora (sin reentrenar nada)."""
+    config_ids = list(config_ids if config_ids is not None else CV_CONFIGS)
+    out_dir = Path(out_dir)
+
+    per_config: dict[str, list[dict]] = {}
+    for cid in config_ids:
+        results = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in sorted((out_dir / cid).glob("fold*.result.json"))]
+        if results:
+            per_config[cid] = results
+
+    if not per_config:
+        raise RuntimeError(f"No hay fold*.result.json en {out_dir} para ninguna configuración.")
+
+    summary = {cid: aggregate(per_config[cid]) for cid in per_config}
+    best = select_best(summary, metric="auprc")
+    return {"summary": summary, "best": best}
 
 
 def run_cv(*, data_dir: Path | str, split_file: Path | str = SPLIT_FILE, out_dir: Path | str = CV_OUT_DIR,
@@ -472,7 +549,7 @@ def run_cv(*, data_dir: Path | str, split_file: Path | str = SPLIT_FILE, out_dir
         result["refit"] = refit_result
 
     _write_json_atomic(out_dir / "summary_cv.json", {
-        "criterion": "media de AUPRC por fold (desempate: menor std)",
+        "criterion": "mediana de AUPRC por fold (desempate: menor IQR)",
         "seed": seed,
         "K": K,
         "configs": summary,
@@ -480,7 +557,7 @@ def run_cv(*, data_dir: Path | str, split_file: Path | str = SPLIT_FILE, out_dir
     })
     _write_json_atomic(out_dir / "best_config.json", {
         "best_config": best,
-        "criterion": "media de AUPRC por fold (desempate: menor std)",
+        "criterion": "mediana de AUPRC por fold (desempate: menor IQR)",
         "refit_threshold": refit_threshold,
         "refit_checkpoint": result.get("refit", {}).get("checkpoint"),
         "config": CONFIG_REGISTRY[best],
@@ -493,16 +570,21 @@ def print_cv_summary(result: dict) -> None:
     print("\n" + "=" * 78)
     print("VALIDACIÓN CRUZADA — RESUMEN")
     print("=" * 78)
-    print(f"Mejor configuración (AUPRC medio, desempate menor std): {result['best']}")
+    print(f"Mejor configuración (AUPRC mediana, desempate menor IQR): {result['best']}")
 
-    header = (f"{'config':<14}{'AUPRC':>20}{'AUC-ROC':>20}"
-              f"{'sens. evento':>16}{'FA/h med':>14}")
+    header = (f"{'config':<14}{'AUPRC':>22}{'AUC-ROC':>22}"
+              f"{'sens. evento':>16}{'FA/h med':>18}")
     print(header)
     print("-" * len(header))
 
     def fmt(agg: dict | None, key: str, decimals: int = 3) -> str:
         v = (agg or {}).get(key)
-        return f"{v['mean']:.{decimals}f}±{v['std']:.{decimals}f}" if v else "—"
+        if not v or v.get("median") is None:
+            return "—"
+        med = f"{v['median']:.{decimals}f}"
+        if v.get("q25") is None or v.get("q75") is None:
+            return med
+        return f"{med} ({v['q25']:.{decimals}f}–{v['q75']:.{decimals}f})"
 
     for cid, agg in result["summary"].items():
         pooled = agg.get("event_sensibility_pooled")
@@ -510,24 +592,29 @@ def print_cv_summary(result: dict) -> None:
         sens = (f"{pooled * 100:.1f}%"
                 f" ({counts.get('detected', 0)}/{counts.get('seizures', 0)})"
                 if pooled is not None else "—")
-        print(f"{cid:<14}{fmt(agg, 'auprc'):>20}{fmt(agg, 'auc_roc'):>20}"
-              f"{sens:>16}{fmt(agg, 'event_median_fa_per_hour', 2):>14}")
+        print(f"{cid:<14}{fmt(agg, 'auprc'):>22}{fmt(agg, 'auc_roc'):>22}"
+              f"{sens:>16}{fmt(agg, 'event_median_fa_per_hour', 2):>18}")
 
     refit = result.get("refit")
     if refit:
-        test_ev = refit["test"]["event"]
-        test_rk = refit["test"]["ranking"]
-        auc = f"{test_rk['auc_roc']:.4f}" if test_rk.get("auc_roc") is not None else "—"
-        auprc = f"{test_rk['auprc']:.4f}" if test_rk.get("auprc") is not None else "—"
         print("-" * len(header))
-        print(f"Refit ({result['best']}) reentrenado sobre todo el pool de desarrollo "
-              f"y evaluado una vez sobre test (para resultados completos y desglosados, buscar refit_results.json):")
-        print(f"  checkpoint: {refit['checkpoint']}  |  umbral: {refit['threshold']}")
-        print(f"  AUC-ROC={auc}  AUPRC={auprc}  "
-              f"sens. evento={test_ev['sensibility']:.4f} "
-              f"({test_ev['n_detected']}/{test_ev['n_seizures']})  "
-              f"FA/h mediana={test_ev['median_false_alarms_per_hour']:.2f}")
+        _print_refit_block(refit, result["best"])
     print("=" * 78)
+
+
+def _print_refit_block(refit: dict, config_id: str) -> None:
+    """Imprime las métricas de test de un refit (checkpoint reentrenado sobre el pool de desarrollo)."""
+    test_ev = refit["test"]["event"]
+    test_rk = refit["test"]["ranking"]
+    auc = f"{test_rk['auc_roc']:.4f}" if test_rk.get("auc_roc") is not None else "—"
+    auprc = f"{test_rk['auprc']:.4f}" if test_rk.get("auprc") is not None else "—"
+    print(f"Refit ({config_id}) reentrenado sobre todo el pool de desarrollo "
+          f"y evaluado una vez sobre test:")
+    print(f"  checkpoint: {refit['checkpoint']}  |  umbral: {refit['threshold']}")
+    print(f"  AUC-ROC={auc}  AUPRC={auprc}  "
+          f"sens. evento={test_ev['sensibility']:.4f} "
+          f"({test_ev['n_detected']}/{test_ev['n_seizures']})  "
+          f"FA/h mediana={test_ev['median_false_alarms_per_hour']:.2f}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -542,6 +629,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Épocas máx por fold.")
     parser.add_argument("--refit-epochs", type=int, default=None,
                         help="Épocas del refit final (default: media de las épocas por fold).")
+    parser.add_argument("--refit-only", type=str, default=None, metavar="CONFIG",
+                        help="Solo reentrenar CONFIG sobre todo el pool de desarrollo y evaluar test, sin correr folds.")
+    parser.add_argument("--refit-threshold", type=float, default=None,
+                        help="Umbral del refit (default: media de los umbrales de los folds de esa config).")
+    parser.add_argument("--select-best-only", action="store_true",
+                        help="Solo agregar los folds ya guardados y elegir la config ganadora, sin entrenar nada.")
     parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     parser.add_argument("--limit-files", type=int, default=None,
                         help="Limitar a N EDFs por split (smoke-test; NUNCA para resultados).")
@@ -565,6 +658,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     try:
+        if args.select_best_only:
+            result = run_select_best(out_dir=args.out_dir,
+                config_ids=[c.strip() for c in args.configs.split(",") if c.strip()])
+            print_cv_summary(result)
+            return
+        if args.refit_only:
+            result = run_refit(args.refit_only, data_dir=args.data_dir, split_file=args.split_file, out_dir=args.out_dir,
+                device=args.device, seed=args.seed, epochs=args.refit_epochs, refit_threshold=args.refit_threshold)
+            print_cv_summary(result)
+            return
         result = run_cv(data_dir=args.data_dir, split_file=args.split_file, out_dir=args.out_dir,
             K=args.folds, seed=args.seed, config_ids=[c.strip() for c in args.configs.split(",") if c.strip()],
             device=args.device, epochs=args.epochs, refit_epochs=args.refit_epochs, limit_files=args.limit_files,
