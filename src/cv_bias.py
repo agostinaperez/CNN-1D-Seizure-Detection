@@ -286,11 +286,15 @@ def threshold_leave_one_out(preds_by_fold: dict[int, dict], *, event_config: dic
         others = [preds_by_fold[j] for j in fold_indices if j != k]
         pooled = _pool_predictions(others)
 
+        # event_metrics espera `valid_files` como objetos Path (usa path.name y path.parent.name),
+        # pero las predicciones guardadas traen strings. Convertimos acá.
+        pooled_valid_files = [Path(f) for f in pooled["valid_files"]]
+
         # Elegimos el umbral sobre las predicciones de los OTROS folds (sin ver el k).
         op_metrics, op_threshold = select_event_operating_point(
             pooled["probs"], pooled["labels"],
             file_ids=pooled["file_ids"], local_ids=pooled["local_ids"],
-            valid_files=pooled["valid_files"], annotations=pooled["annotations"],
+            valid_files=pooled_valid_files, annotations=pooled["annotations"],
             max_false_alarms_per_hour=max_fa,
             n_within=n_within, n_window=n_window,
             min_alarm_interval=min_alarm_interval, max_latency=max_latency,
@@ -301,7 +305,7 @@ def threshold_leave_one_out(preds_by_fold: dict[int, dict], *, event_config: dic
             op_metrics, op_threshold = select_lowest_false_alarm_point(
                 pooled["probs"], pooled["labels"],
                 file_ids=pooled["file_ids"], local_ids=pooled["local_ids"],
-                valid_files=pooled["valid_files"], annotations=pooled["annotations"],
+                valid_files=pooled_valid_files, annotations=pooled["annotations"],
                 n_within=n_within, n_window=n_window,
                 min_alarm_interval=min_alarm_interval, max_latency=max_latency,
                 thresholds=threshold_grid,
