@@ -33,9 +33,11 @@ from src.config import (
     FS,
     MODELS_DIR,
     N_CHANNELS,
+    POSITIVES_FOR_EVENT,
     THRESHOLD,
     WIN_SAMPLES,
     WIN_SECONDS_EFFECTIVE,
+    WINDOW_RANGE_FOR_EVENT,
 )
 from src.compute_metrics import count_parameters, measure_flops, measure_inference_latency
 from src.evaluate import load_checkpoint, rebuild_model
@@ -232,6 +234,11 @@ async def infer(
     if not 0.0 <= thr <= 1.0:
         raise HTTPException(status_code=400, detail="El umbral debe estar entre 0 y 1")
 
+    event_config = state["checkpoint"].get("event_config", {})
+    n_within = event_config.get("n_within", POSITIVES_FOR_EVENT)
+    n_window = event_config.get("n_window", WINDOW_RANGE_FOR_EVENT)
+    min_alarm_interval = event_config.get("min_alarm_interval", EVENT_MIN_ALARM_INTERVAL)
+
     # Guardamos el EDF en un temporal (mne necesita una ruta de archivo).
     tmp = BASE_DIR / "inferences" / "_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -267,7 +274,10 @@ async def infer(
 
         ends = decision_times_from_starts(starts)
         preds = probabilities >= thr
-        events = detect_event_intervals(starts, ends, preds, min_alarm_interval=EVENT_MIN_ALARM_INTERVAL)
+        events = detect_event_intervals(
+            starts, ends, preds,
+            n_within=n_within, n_window=n_window, min_alarm_interval=min_alarm_interval,
+        )
 
         signal_payload = _downsample_signal(filtered)
         inference_s = time.perf_counter() - t0

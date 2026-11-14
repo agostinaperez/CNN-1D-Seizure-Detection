@@ -149,6 +149,19 @@
       }
       .callout strong { color: var(--text); }
 
+      .formula {
+        padding: 1rem 1.2rem;
+        margin: .8rem 0;
+        background: var(--surface-raised);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        font-family: "Cascadia Code", "Consolas", "SFMono-Regular", Menlo, monospace;
+        font-size: .92rem;
+        line-height: 2;
+        color: var(--accent-strong);
+        overflow-x: auto;
+      }
+
       .tag-list { display: flex; flex-wrap: wrap; gap: .5rem; padding: 0; list-style: none; }
       .tag-list li { padding: .3rem .7rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .85rem; }
 
@@ -200,7 +213,7 @@
           <p class="lead">Una red neuronal convolucional 1D (CNN-1D) clasifica ventanas de EEG como actividad ictal o basal y busca facilitar la revisión de registros prolongados.</p>
           <p class="hero-meta">Agostina Pérez · Instituto Universitario Aeronáutico · Docente: Gonzalez, Hernando Alexis</p>
           <div class="actions">
-            <a class="button primary" href="https://github.com/agostinaperez/ia-final">Ver código en GitHub</a>
+            <a class="button primary" href="https://github.com/agostinaperez/CNN-1D-Seizure-Detection">Ver código en GitHub</a>
             <a class="button" href="INFORME_TECNICO.pdf">Leer informe técnico (PDF)</a>
           </div>
         </section>
@@ -326,8 +339,21 @@
                 <li>La sensibilidad de evento del refit CV (55,9 %) queda por debajo del objetivo exploratorio de 90 %.</li>
                 <li>El refit CV respeta el techo de 1 falsa alarma/h (0,61), pero el modelo final previo (2,42/h) lo superaba: la elección del umbral fijo define el compromiso sensibilidad/alarmas.</li>
                 <li>Las crisis cortas son difíciles: en un paciente con eventos de aproximadamente 8 s, se detectaron 2 de 10.</li>
-                <li>La evaluación de test contiene 34 crisis; la diferencia entre configuraciones no permite afirmar una mejora concluyente.</li>
+                <li>La evaluación de test contiene 34 crisis; la diferencia entre configuraciones no permite afirmar una mejora concluyente (ver <a href="#incertidumbre">incertidumbre estadística</a>).</li>
               </ul>
+            </article>
+            <article class="card" id="incertidumbre" style="margin-top: 1rem">
+              <h3>Incertidumbre estadística de la sensibilidad (19/34)</h3>
+              <p>La sensibilidad de evento del modelo ganador es <strong>19 de 34 crisis (55,9 %)</strong>. Al ser una proporción estimada sobre una muestra finita, tiene un margen de error. Para cuantificarlo se usa un intervalo de confianza del 95 % para una proporción binomial, con x = 19 aciertos sobre n = 34 (proporción muestral p̂ = 19/34 = 0,559).</p>
+              <p>El <strong>intervalo de Wilson</strong> (más robusto que el clásico para muestras pequeñas) es, con z = 1,96 para el nivel 95 %:</p>
+              <div class="formula">
+                centro&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= ( p̂ + z²/(2n) ) / ( 1 + z²/n )<br>
+                semi-ancho = z · √( p̂(1−p̂)/n + z²/(4n²) ) / ( 1 + z²/n )
+              </div>
+              <p>Sustituyendo: p̂(1−p̂)/n = 0,00725, z²/(2n) = 0,0565, z²/n = 0,113, z²/(4n²) = 0,000831. Resulta <strong>centro = 0,553</strong> y <strong>semi-ancho = 0,158</strong>.</p>
+              <p><strong>IC 95 % = [39,5 % ; 71,1 %]</strong>. (El intervalo exacto de Clopper–Pearson, más conservador, da 37,9 % a 72,8 %, el «37–71 %» aproximado citado por el docente.)</p>
+              <p><strong>Por qué es tan amplio:</strong> el ancho depende de 1/√n. Con n = 34, √(1/34) ≈ 0,17, de modo que ya hay ~17 % de incertidumbre de base antes de multiplicar por z = 1,96. Para achicar el intervalo a la mitad harían falta ~4 veces más crisis (~136), no el doble.</p>
+              <p><strong>Consecuencia:</strong> las estimaciones del modelo final (23/34 = 67,6 %) y del BCE (22/34 = 64,7 %) caen dentro del [39,5 % ; 71,1 %]. Con ese solapamiento, una diferencia de 3–4 crisis sobre 34 no distingue una mejora real de una fluctuación por azar: la comparación entre modelos no es concluyente con este tamaño de test.</p>
             </article>
         </section>
 
@@ -338,8 +364,8 @@
             <article class="card">
               <h3>Material del proyecto</h3>
               <ul>
-                <li><a href="https://github.com/agostinaperez/ia-final">Repositorio y código fuente</a></li>
-                <li><a href="https://github.com/agostinaperez/ia-final/blob/main/README.md">README del repositorio</a></li>
+                <li><a href="https://github.com/agostinaperez/CNN-1D-Seizure-Detection">Repositorio y código fuente</a></li>
+                <li><a href="https://github.com/agostinaperez/CNN-1D-Seizure-Detection/blob/main/README.md">README del repositorio</a></li>
                 <li><a href="INFORME_TECNICO.pdf">Informe técnico en PDF</a></li>
               </ul>
             </article>

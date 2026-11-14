@@ -12,7 +12,7 @@ load_dotenv()
 
 # Rutas del proyecto
 
-# Directorio raíz: ia-final/
+# Directorio raíz: CNN-1D-Seizure-Detection/
 BASE_DIR = Path(__file__).resolve().parent.parent # .resolve() normaliza la ruta, .parent sube un nivel por vez.
 # Carpeta de datos procesados (split.json, ventanas, stats).
 PROCESSED_DIR = BASE_DIR / "data" / "processed"

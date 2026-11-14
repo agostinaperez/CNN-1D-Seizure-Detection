@@ -125,7 +125,10 @@ def load_16_channels(path, fs_expected: int = FS) -> tuple[np.ndarray | None, st
       - data: (16, N) float64, reason None, plan completo del montaje.
       - data None, reason != None y plan=None si el archivo hay que descartarlo.
     """
-    raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
+    try:
+        raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
+    except Exception:
+        return None, "edf_no_legible"
     sampling_rate = float(raw.info["sfreq"])
     if abs(sampling_rate - fs_expected) > 1e-6:
         raw.close()

@@ -14,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -102,9 +103,11 @@ def parse_args() -> argparse.Namespace:
 
 def evaluate_checkpoint_on_split(checkpoint_path: Path | str, *, data_dir: Path | str, split: dict, split_name: str = "val",
     device: str | None = None, batch_size: int = BATCH_SIZE, num_workers: int = NUM_WORKERS, threshold: float | None = None, limit_files: int | None = None,
-    reselect_operating_point: bool = True,) -> dict:
+    reselect_operating_point: bool = True, return_predictions: bool = False,) -> dict:
     """Mide un checkpoint sobre un split dado, reutilizando el scaler embebido.
     Devuelve un dict con ranking, ventana y evento + la metadata del checkpoint.
+
+    Si return_predictions=True agrego la clave predictions con las probabilidades/etiquetas/índices crudos de cada ventana
     """
     device = get_device(device)
 
@@ -212,7 +215,7 @@ def evaluate_checkpoint_on_split(checkpoint_path: Path | str, *, data_dir: Path 
                              f"falsas alarmas/h. Mostrando el de menor mediana (umbral {ev_threshold:.2f}).")
         thr = ev_threshold
 
-    return {
+    result = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_name": checkpoint_path.name,
         "split": split_name,
@@ -237,6 +240,20 @@ def evaluate_checkpoint_on_split(checkpoint_path: Path | str, *, data_dir: Path 
         "window": m,
         "event": ev,
     }
+
+    # Predicciones crudas de cada ventana (en el orden natural del split, sin shuffle).
+    if return_predictions:
+        dataset._ensure_index()
+        result["predictions"] = {
+            "probs": probs.numpy().astype(np.float64),
+            "labels": labels.numpy().astype(np.int8),
+            "file_ids": dataset.file_ids.astype(np.int32),
+            "local_ids": dataset.local_ids.astype(np.int32),
+            "valid_files": [str(p) for p in dataset.valid_files],
+            "annotations": {k: [list(iv) for iv in v] for k, v in dataset.annotations.items()},
+        }
+
+    return result
 
 
 def print_evaluation_report(result: dict) -> None:

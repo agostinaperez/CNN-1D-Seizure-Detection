@@ -48,16 +48,33 @@ def test_label_windows_overlap():
 
 
 def test_apply_scaler():
-    windows = np.full((2, 16, 10), 5.0, dtype=np.float32)
+    windows = np.arange(2 * 16 * 3, dtype=np.float32).reshape(2, 16, 3)
+    median = np.arange(1, 17, dtype=np.float64)
+    iqr = np.arange(2, 18, dtype=np.float64)
     stats = {
         "channels": list(CHANNELS_TUEV),
-        "median": np.zeros(16, dtype=np.float64),
-        "iqr": np.ones(16, dtype=np.float64),
+        "median": median,
+        "iqr": iqr,
     }
+
     out = apply_scaler(windows, stats)
     assert out.shape == windows.shape
     assert out.dtype == np.float32
-    np.testing.assert_allclose(out, 5.0)
+    expected = (windows - median[None, :, None]) / iqr[None, :, None]
+    np.testing.assert_allclose(out, expected)
+
+
+def test_apply_scaler_uses_one_as_denominator_for_zero_iqr():
+    windows = np.arange(16, dtype=np.float32).reshape(1, 16, 1)
+    median = np.zeros(16, dtype=np.float64)
+    iqr = np.full(16, 2.0, dtype=np.float64)
+    iqr[0] = 0.0
+    stats = {"channels": list(CHANNELS_TUEV), "median": median, "iqr": iqr}
+
+    out = apply_scaler(windows, stats)
+
+    expected = windows / np.where(iqr == 0, 1.0, iqr)[None, :, None]
+    np.testing.assert_allclose(out, expected)
 
 
 def test_compute_stats_for_patients_filters_by_patient(tmp_path, monkeypatch):
