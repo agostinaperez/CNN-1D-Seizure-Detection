@@ -485,6 +485,50 @@ def print_threshold_bias_report(report: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regeneración de predicciones (para la opción 1) — no entrena nada
+# ---------------------------------------------------------------------------
+
+
+def regenerate_predictions(out_dir: Path, *, data_dir: Path | str, split_file: Path | str,
+                           config_ids: list[str], device: str | None = None,
+                           batch_size: int | None = None) -> None:
+    """Regenera y guarda las predicciones de validación de cada fold re-evaluando
+    los checkpoints ``fold*.pt`` ya guardados. No entrena nada: solo pasa cada modelo
+    por SU PROPIO val (los pacientes que le tocaron en la corrida original) y persiste
+    las probs con ``save_predictions``.
+
+    Requiere el dataset (``data_dir``) y el ``split.json`` originales, más los ``fold*.pt``
+    y ``fold*.result.json`` en ``out_dir``. Es el paso previo para poder correr
+    ``--threshold-bias`` cuando la corrida original no guardó predicciones.
+    """
+    # Imports diferidos para no crear un import circular con src.cv (que importa cv_bias).
+    from src.config import BATCH_SIZE
+    from src.cv import build_fold_split
+    from src.evaluate import evaluate_checkpoint_on_split
+
+    base_split = json.loads(Path(split_file).read_text(encoding="utf-8"))
+    for cid in config_ids:
+        fold_results = load_fold_results(out_dir, cid)
+        for r in fold_results:
+            fold_idx = int(r["fold"])
+            # Reconstruimos el MISMO fold_split de la corrida original (así el split_id
+            # del checkpoint coincide y evaluate no lo rechaza).
+            fold_split = build_fold_split(base_split, r["train_patients"], r["val_patients"])
+            ckpt = out_dir / cid / f"fold{fold_idx}.pt"
+            if not ckpt.is_file():
+                raise FileNotFoundError(f"Falta el checkpoint {ckpt} para re-evaluar.")
+
+            print(f"[{cid}] fold {fold_idx}: re-evaluando su val (sin entrenar)...")
+            eval_res = evaluate_checkpoint_on_split(
+                ckpt, data_dir=data_dir, split=fold_split, split_name="val",
+                device=device, batch_size=batch_size or BATCH_SIZE,
+                reselect_operating_point=False, return_predictions=True,
+            )
+            save_predictions(out_dir, cid, fold_idx, eval_res["predictions"])
+            print(f"   predicciones guardadas en {out_dir / cid / f'fold{fold_idx}.preds.npz'}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -495,11 +539,18 @@ def _parse_args() -> argparse.Namespace:
                         help="Carpeta de resultados de la CV (contiene <config>/fold*.json).")
     parser.add_argument("--configs", type=str, default=",".join(CV_CONFIGS),
                         help="Configuraciones separadas por coma.")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Dataset CHB-MIT (solo para --regenerate-predictions).")
+    parser.add_argument("--split-file", type=str, default=None,
+                        help="split.json (solo para --regenerate-predictions).")
+    parser.add_argument("--device", type=str, default=None, help="'cuda' o 'cpu'.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--epoch-bias", action="store_true",
                        help="Medir el sesgo de selección de época (opción 2).")
     group.add_argument("--threshold-bias", action="store_true",
                        help="Medir el sesgo de selección de umbral (opción 1).")
+    group.add_argument("--regenerate-predictions", action="store_true",
+                       help="Re-evaluar los checkpoints y guardar sus predicciones (prerequisito de --threshold-bias).")
     return parser.parse_args()
 
 
@@ -508,6 +559,13 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     config_ids = [c.strip() for c in args.configs.split(",") if c.strip()]
     try:
+        if args.regenerate_predictions:
+            if not args.data_dir or not args.split_file:
+                sys.exit("--regenerate-predictions requiere --data-dir y --split-file.")
+            regenerate_predictions(out_dir, data_dir=args.data_dir, split_file=args.split_file,
+                                   config_ids=config_ids, device=args.device)
+            print("\nPredicciones regeneradas. Ahora corré --threshold-bias.")
+            return
         if args.epoch_bias:
             report = epoch_debiased_summary(out_dir, config_ids)
             print_epoch_bias_report(report)
