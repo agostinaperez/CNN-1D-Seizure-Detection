@@ -5,6 +5,7 @@ la lógica de selección leave-one-out y la agregación, sin tocar el dataset ni
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -172,7 +173,9 @@ def test_threshold_leave_one_out_uses_other_folds(monkeypatch):
     )
 
     # Para el fold 0, el umbral se eligió SOLO con los folds 1 y 2 (no el 0).
-    assert selections[0]["valid_files"] == ["f1.edf", "f2.edf"]
+    # Además, valid_files debe llegar como Path (event_metrics usa path.name).
+    assert all(isinstance(f, Path) for f in selections[0]["valid_files"])
+    assert [f.name for f in selections[0]["valid_files"]] == ["f1.edf", "f2.edf"]
     assert selections[0]["file_ids"].tolist() == [0, 0, 0, 1, 1, 1]
     # Y el evento del fold 0 se evaluó con su propia data y el umbral elegido.
     assert events[0]["threshold"] == 0.42

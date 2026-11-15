@@ -3,13 +3,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.config import POSITIVES_FOR_EVENT, WINDOW_RANGE_FOR_EVENT
+import src.metrics as metrics_module
+from src.config import (
+    FS,
+    POSITIVES_FOR_EVENT,
+    STRIDE_SAMPLES,
+    WIN_SECONDS_EFFECTIVE,
+    WINDOW_RANGE_FOR_EVENT,
+)
 from src.metrics import (
+    _span_hours,
+    _span_hours_by_file,
     binary_metrics,
     detect_alarm_indices,
     detect_event_intervals,
     event_metrics,
     rank_metrics,
+    select_event_operating_point,
+    select_lowest_false_alarm_point,
 )
 from src.timing import decision_times_from_local_ids
 
@@ -95,3 +106,101 @@ def test_rank_metrics_perfect_separation():
     rk = rank_metrics(probs, labels)
     assert rk["auc_roc"] == pytest.approx(1.0)
     assert rk["auprc"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- horas cubiertas
+def test_span_hours():
+    span_s_1 = WIN_SECONDS_EFFECTIVE
+    span_s_3 = (3 - 1) * (STRIDE_SAMPLES / FS) + WIN_SECONDS_EFFECTIVE
+    assert _span_hours(0) == 0.0
+    assert _span_hours(1) == pytest.approx(span_s_1 / 3600.0)
+    assert _span_hours(3) == pytest.approx(span_s_3 / 3600.0)
+
+
+def test_span_hours_by_file_sums_per_file():
+    # archivo 0: 3 ventanas, archivo 1: 2 ventanas
+    file_ids = np.array([0, 0, 0, 1, 1])
+    local_ids = np.array([0, 1, 2, 0, 1])
+    expected = _span_hours(3) + _span_hours(2)
+    assert _span_hours_by_file(file_ids, local_ids) == pytest.approx(expected)
+
+
+def test_binary_metrics_false_positives_per_hour():
+    probs = np.array([0.9, 0.1])
+    labels = np.array([0, 0])
+    file_ids = np.array([0, 0])
+    local_ids = np.array([0, 1])
+    m = binary_metrics(probs, labels, 0.5, file_ids=file_ids, local_ids=local_ids)
+    span_s = (2 - 1) * (STRIDE_SAMPLES / FS) + WIN_SECONDS_EFFECTIVE
+    expected_fp_per_hour = 1.0 / (span_s / 3600.0)
+    assert m["false_positive"] == 1
+    assert m["false_positive_per_hour"] == pytest.approx(expected_fp_per_hour)
+
+
+# ---------------------------------------------------------------- punto de operación
+def test_select_event_operating_point_respects_ceiling(monkeypatch):
+    results = {
+        0.3: {"sensibility": 0.9, "median_false_alarms_per_hour": 2.0},  # excede techo
+        0.5: {"sensibility": 0.6, "median_false_alarms_per_hour": 0.8},
+        0.7: {"sensibility": 0.8, "median_false_alarms_per_hour": 0.9},
+        0.9: {"sensibility": 0.4, "median_false_alarms_per_hour": 0.1},
+    }
+
+    def fake(probs, labels, **kw):
+        return results[kw["threshold"]]
+
+    monkeypatch.setattr(metrics_module, "event_metrics", fake)
+    best, thr = select_event_operating_point(
+        [0.5], [0], file_ids=[0], local_ids=[0], valid_files=[], annotations={},
+        max_false_alarms_per_hour=1.0, thresholds=[0.3, 0.5, 0.7, 0.9],
+    )
+    # entre los que respetan el techo (0.5, 0.7, 0.9) el de mayor sensibilidad es 0.7 (0.8)
+    assert thr == 0.7
+    assert best["sensibility"] == 0.8
+
+
+def test_select_event_operating_point_tie_break_lower_fa(monkeypatch):
+    results = {
+        0.5: {"sensibility": 0.7, "median_false_alarms_per_hour": 0.9},
+        0.7: {"sensibility": 0.7, "median_false_alarms_per_hour": 0.2},
+    }
+
+    def fake(probs, labels, **kw):
+        return results[kw["threshold"]]
+
+    monkeypatch.setattr(metrics_module, "event_metrics", fake)
+    best, thr = select_event_operating_point(
+        [0.5], [0], file_ids=[0], local_ids=[0], valid_files=[], annotations={},
+        max_false_alarms_per_hour=1.0, thresholds=[0.5, 0.7],
+    )
+    assert thr == 0.7  # misma sensibilidad, menor FA mediana
+
+
+def test_select_event_operating_point_none_when_none_respect_ceiling(monkeypatch):
+    def fake(probs, labels, **kw):
+        return {"sensibility": 0.5, "median_false_alarms_per_hour": 2.0}
+
+    monkeypatch.setattr(metrics_module, "event_metrics", fake)
+    best, thr = select_event_operating_point(
+        [0.5], [0], file_ids=[0], local_ids=[0], valid_files=[], annotations={},
+        max_false_alarms_per_hour=1.0, thresholds=[0.3, 0.5],
+    )
+    assert best is None and thr is None
+
+
+def test_select_lowest_false_alarm_point_tie_break_sensibility(monkeypatch):
+    results = {
+        0.5: {"sensibility": 0.6, "median_false_alarms_per_hour": 0.9},
+        0.7: {"sensibility": 0.3, "median_false_alarms_per_hour": 0.2},
+        0.9: {"sensibility": 0.4, "median_false_alarms_per_hour": 0.2},  # empate FA, mayor sens
+    }
+
+    def fake(probs, labels, **kw):
+        return results[kw["threshold"]]
+
+    monkeypatch.setattr(metrics_module, "event_metrics", fake)
+    best, thr = select_lowest_false_alarm_point(
+        [0.5], [0], file_ids=[0], local_ids=[0], valid_files=[], annotations={},
+        thresholds=[0.5, 0.7, 0.9],
+    )
+    assert thr == 0.9  # menor FA mediana (0.2), desempate por mayor sensibilidad

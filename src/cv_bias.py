@@ -1,30 +1,10 @@
-"""
-Análisis del sesgo optimista de la validación cruzada (offline, sin reentrenar).
+"""Este módulo cuantifica el sesgo sin volver a entrenar.
 
-El problema
------------
-En la CV actual, para cada fold k el modelo usa las ETIQUETAS del propio fold k para
-tomar DOS decisiones:
-  1. qué ÉPOCA guardar (early stopping + criterio clínico sobre el val del fold k);
-  2. qué UMBRAL de decisión usar (barrido de la grilla sobre el val del fold k).
+  * ``--epoch-bias``: para cada fold k, se usa como época la mediana de los mejores epochs de los otros folds (leave-one-out). Como las curvas por época
+    ya están en ``fold{i}.history.json``, alcanza con leerlas.
 
-Como después reportás las métricas sobre ese MISMO fold k, el número sale optimista
-(las decisiones "vieron" las etiquetas que después medís). El conjunto de TEST no
-tiene este sesgo: umbral y época se fijaron ANTES de verlo.
-
-Este módulo cuantifica el sesgo SIN volver a entrenar, con dos análisis complementarios:
-
-  * ``--epoch-bias``   (opción 2): para cada fold k, se usa como época la MEDIANA de
-    los mejores epochs de los OTROS folds (leave-one-out). Como las curvas por época
-    ya están en ``fold{i}.history.json``, alcanza con leerlas. Mide el sesgo de la
-    SELECCIÓN DE ÉPOCA. Las métricas de ranking (AUPRC / AUC-ROC) quedan limpiamente
-    debiased; las de evento todavía usan el umbral propio del fold en esa época
-    (el sesgo de umbral se mide aparte, con ``--threshold-bias``).
-
-  * ``--threshold-bias`` (opción 1): para cada fold k, se elige el umbral con las
-    predicciones de validación de los OTROS folds (leave-one-out) y se evalúa el
-    fold k con ese umbral. Mide el sesgo de la SELECCIÓN DE UMBRAL. Requiere las
-    probabilidades de validación guardadas por ``run_fold`` (``fold{i}.preds.npz``
+  * ``--threshold-bias``: para cada fold k, se elige el umbral con el mismo método de leave-one-out y se evalúa el
+    fold k con ese umbral. Mide el sesgo de la selección de umbral. Requiere las probabilidades de validación guardadas por ``run_fold`` (``fold{i}.preds.npz``
     + ``fold{i}.preds.json``) o regeneradas con ``evaluate_checkpoint_predictions``.
 
 Uso
@@ -61,10 +41,7 @@ from src.metrics import (
 )
 from src.protocol import THRESHOLD_GRID
 
-# ---------------------------------------------------------------------------
-# Helpers de E/S (artefactos que ya existen en <out_dir>/<config>/)
-# ---------------------------------------------------------------------------
-
+# Helpers
 
 def _fold_result_paths(out_dir: Path, config_id: str) -> list[tuple[int, Path]]:
     """Devuelve [(fold_idx, ruta foldX.result.json)] ordenados por índice de fold."""
@@ -95,17 +72,9 @@ def load_fold_history(out_dir: Path, config_id: str, fold_idx: int) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-# ---------------------------------------------------------------------------
-# Selección de época por mediana leave-one-out (opción 2)
-# ---------------------------------------------------------------------------
-
-
+# Selección de época por mediana leave-one-out 
 def median_epoch_leave_one_out(fold_results: list[dict]) -> dict[int, int]:
-    """Para cada fold k, devuelve la MEDIANA (redondeada) de los best_epoch de los demás folds.
-
-    Es la misma idea que usa ``refit_final`` para elegir la cantidad de épocas del
-    refit, pero aplicada fold por fold: así la época del fold k nunca depende de las
-    etiquetas del fold k.
+    """Para cada fold k, devuelve la mediana (redondeada) de los best_epoch de los demás folds.
     """
     epochs_by_fold = {int(r["fold"]): int(r["best_epoch"]) for r in fold_results}
     fold_indices = sorted(epochs_by_fold)
@@ -157,15 +126,14 @@ _EPOCH_METRICS = {
     "auprc": ("auprc", "val_auprc"),
     "auc_roc": ("auc_roc", "val_auc_roc"),
     "event_sensibility": ("event_sensibility", "event_sensibility"),
-    # Ojo: el result.json usa "event_median_fa_per_hour" pero el history.json por época usa
+    # el result.json usa "event_median_fa_per_hour" pero el history.json por época usa
     # "event_median_false_alarms_per_hour" (dos nombres distintos para lo mismo).
     "event_median_fa_per_hour": ("event_median_fa_per_hour", "event_median_false_alarms_per_hour"),
 }
 
 
 def epoch_debiased_summary(out_dir: Path, config_ids: list[str]) -> dict:
-    """Compara, config por config, las métricas REPORTADAS (en el best_epoch propio de
-    cada fold) contra las DEBIASED (en el epoch mediano de los otros folds).
+    """Compara, config por config, las métricas reportadas contra las nuevas sin sesgo
 
     Devuelve un dict listo para serializar y para ``print_epoch_bias_report``.
     """
@@ -175,7 +143,6 @@ def epoch_debiased_summary(out_dir: Path, config_ids: list[str]) -> dict:
         median_epochs = median_epoch_leave_one_out(fold_results)
 
         per_fold: list[dict] = []
-        # Acumulo valores reportados y debiased de cada métrica para agregar después.
         reported_vals: dict[str, list] = {m: [] for m in _EPOCH_METRICS}
         debiased_vals: dict[str, list] = {m: [] for m in _EPOCH_METRICS}
 
@@ -223,11 +190,6 @@ def epoch_debiased_summary(out_dir: Path, config_ids: list[str]) -> dict:
     return report
 
 
-# ---------------------------------------------------------------------------
-# Umbral leave-one-out (opción 1) — requiere predicciones guardadas
-# ---------------------------------------------------------------------------
-
-
 def _pool_predictions(preds_list: list[dict]) -> dict:
     """Concatena varias corridas de predicciones remapeando los file_ids para que
     no colisionen entre folds (cada fold empieza su numeración en 0).
@@ -265,11 +227,10 @@ def _pool_predictions(preds_list: list[dict]) -> dict:
 
 def threshold_leave_one_out(preds_by_fold: dict[int, dict], *, event_config: dict | None = None,
                             threshold_grid: list[float] | None = None) -> dict:
-    """Para cada fold k, elige el umbral con las predicciones de los OTROS folds y
-    reevalúa el evento del fold k con ese umbral (leave-one-out de umbral).
+    """leave-one-out para medir el sesgo de umbral.
+    Para cada fold k elige el umbral c las predicciones de validación de los otros folds, y recalcula las métricas a nivel de evento del fold k con ese umbral
 
-    ``preds_by_fold``: {fold_idx: dict de ``load_predictions``}. Devuelve
-    {fold_idx: {"threshold": t_k, "event": ev_k}}.
+    ``preds_by_fold``: {fold_idx: dict de ``load_predictions``}. Devuelve {fold_idx: {"threshold": t_k, "event": ev_k}}.
     """
     event_config = event_config or {}
     n_within = event_config.get("n_within", POSITIVES_FOR_EVENT)
@@ -286,11 +247,10 @@ def threshold_leave_one_out(preds_by_fold: dict[int, dict], *, event_config: dic
         others = [preds_by_fold[j] for j in fold_indices if j != k]
         pooled = _pool_predictions(others)
 
-        # event_metrics espera `valid_files` como objetos Path (usa path.name y path.parent.name),
-        # pero las predicciones guardadas traen strings. Convertimos acá.
+        # event_metrics espera `valid_files` como objetos Path (usa path.name y path.parent.name), pero las predicciones guardadas traen strings así q convierto
         pooled_valid_files = [Path(f) for f in pooled["valid_files"]]
 
-        # Elegimos el umbral sobre las predicciones de los OTROS folds (sin ver el k).
+        # umbral se elije sobre las predicciones de los otros folds
         op_metrics, op_threshold = select_event_operating_point(
             pooled["probs"], pooled["labels"],
             file_ids=pooled["file_ids"], local_ids=pooled["local_ids"],
@@ -327,8 +287,7 @@ def threshold_leave_one_out(preds_by_fold: dict[int, dict], *, event_config: dic
 def threshold_debiased_summary(out_dir: Path, config_ids: list[str]) -> dict:
     """Lee las predicciones guardadas de cada fold y computa el umbral leave-one-out.
 
-    Para cada config compara: umbral REPORTADO (del result.json) vs umbral LOO, y la
-    sensibilidad de evento con cada umbral. Devuelve un dict serializable.
+    Para cada config compara umbral reportado vs umbral LOO, y la sensibilidad de evento con cada umbral. Devuelve un dict serializable.
     """
     report: dict = {}
     for cid in config_ids:
@@ -386,11 +345,6 @@ def threshold_debiased_summary(out_dir: Path, config_ids: list[str]) -> dict:
     return report
 
 
-# ---------------------------------------------------------------------------
-# Guardado / carga de predicciones de validación (para la opción 1)
-# ---------------------------------------------------------------------------
-
-
 def save_predictions(out_dir: Path, config_id: str, fold_idx: int, predictions: dict) -> Path:
     """Persiste las predicciones de validación de un fold en ``fold{i}.preds.npz``
     + ``fold{i}.preds.json`` (metadatos que no caben cómodo en un .npz).
@@ -440,11 +394,6 @@ def load_predictions(out_dir: Path, config_id: str, fold_idx: int) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Reportes por pantalla
-# ---------------------------------------------------------------------------
-
-
 def print_epoch_bias_report(report: dict) -> None:
     print("\n" + "=" * 88)
     print("SESGO DE ÉPOCA (opción 2) — reportado vs época mediana de los otros folds")
@@ -488,24 +437,14 @@ def print_threshold_bias_report(report: dict) -> None:
     print("=" * 88)
 
 
-# ---------------------------------------------------------------------------
-# Regeneración de predicciones (para la opción 1) — no entrena nada
-# ---------------------------------------------------------------------------
 
+def regenerate_predictions(out_dir: Path, *, data_dir: Path | str, split_file: Path | str, config_ids: list[str], device: str | None = None, batch_size: int | None = None) -> None:
+    """Regenera y guarda las predicciones de validación de cada fold re-evaluando los checkpoints ``fold*.pt`` ya guardados. Pasa cada modelo por su propio val y persiste las probs con save_predictions.
 
-def regenerate_predictions(out_dir: Path, *, data_dir: Path | str, split_file: Path | str,
-                           config_ids: list[str], device: str | None = None,
-                           batch_size: int | None = None) -> None:
-    """Regenera y guarda las predicciones de validación de cada fold re-evaluando
-    los checkpoints ``fold*.pt`` ya guardados. No entrena nada: solo pasa cada modelo
-    por SU PROPIO val (los pacientes que le tocaron en la corrida original) y persiste
-    las probs con ``save_predictions``.
-
-    Requiere el dataset (``data_dir``) y el ``split.json`` originales, más los ``fold*.pt``
-    y ``fold*.result.json`` en ``out_dir``. Es el paso previo para poder correr
-    ``--threshold-bias`` cuando la corrida original no guardó predicciones.
+    Requiere el dataset y el split.json originales, más los ``fold*.pt`` y ``fold*.result.json`` en out_dir.
+    Es el paso previo para poder correr ``--threshold-bias`` cuando la el entrenamiento no guardó predicciones.
     """
-    # Imports diferidos para no crear un import circular con src.cv (que importa cv_bias).
+    # Imports diferidos para no crear un import circular con src.cv
     from src.config import BATCH_SIZE
     from src.cv import build_fold_split
     from src.evaluate import evaluate_checkpoint_on_split
@@ -515,14 +454,13 @@ def regenerate_predictions(out_dir: Path, *, data_dir: Path | str, split_file: P
         fold_results = load_fold_results(out_dir, cid)
         for r in fold_results:
             fold_idx = int(r["fold"])
-            # Reconstruimos el MISMO fold_split de la corrida original (así el split_id
-            # del checkpoint coincide y evaluate no lo rechaza).
+            # Reconstruyo el mismo fold_split de la corrida original así coincide el split id
             fold_split = build_fold_split(base_split, r["train_patients"], r["val_patients"])
             ckpt = out_dir / cid / f"fold{fold_idx}.pt"
             if not ckpt.is_file():
                 raise FileNotFoundError(f"Falta el checkpoint {ckpt} para re-evaluar.")
 
-            print(f"[{cid}] fold {fold_idx}: re-evaluando su val (sin entrenar)...")
+            print(f"[{cid}] fold {fold_idx}: re-evaluando su val...")
             eval_res = evaluate_checkpoint_on_split(
                 ckpt, data_dir=data_dir, split=fold_split, split_name="val",
                 device=device, batch_size=batch_size or BATCH_SIZE,
@@ -530,11 +468,6 @@ def regenerate_predictions(out_dir: Path, *, data_dir: Path | str, split_file: P
             )
             save_predictions(out_dir, cid, fold_idx, eval_res["predictions"])
             print(f"   predicciones guardadas en {out_dir / cid / f'fold{fold_idx}.preds.npz'}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def _parse_args() -> argparse.Namespace:

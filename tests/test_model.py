@@ -21,6 +21,18 @@ def test_parameter_count():
     assert info["n_params_total"] == 871489
 
 
+def test_predict_proba_matches_sigmoid_and_in_range():
+    model = SeizureCNN()
+    model.eval()
+    x = torch.randn(1, N_CHANNELS, WIN_SAMPLES)
+    with torch.no_grad():
+        logits = model(x)
+        proba = model.predict_proba(x)
+    assert proba.shape == (1, 1)
+    assert bool((proba >= 0).all() and (proba <= 1).all())
+    torch.testing.assert_close(proba, torch.sigmoid(logits))
+
+
 def test_checkpoint_roundtrip(tmp_path):
     model = SeizureCNN()
     model.eval()
