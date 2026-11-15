@@ -13,7 +13,15 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from src.config import FS, STRIDE_SAMPLES, WIN_SECONDS_EFFECTIVE
+from src.config import (
+    EVENT_MAX_LATENCY,
+    EVENT_MIN_ALARM_INTERVAL,
+    FS,
+    POSITIVES_FOR_EVENT,
+    STRIDE_SAMPLES,
+    WINDOW_RANGE_FOR_EVENT,
+    WIN_SECONDS_EFFECTIVE,
+)
 from src.protocol import THRESHOLD_GRID
 from src.timing import decision_times_from_local_ids
 
@@ -126,44 +134,71 @@ def rank_metrics(probs, labels) -> dict:
     }
 
 
-def detect_event_intervals(window_starts, window_ends, predictions, *, min_alarm_interval: float = 30.0,) -> list[tuple[float, float]]:
-    """Agrupa ventanas positivas en episodios de crisis para inferencia.
+def detect_alarm_indices(predictions, decision_times, *, n_within: int = POSITIVES_FOR_EVENT,
+                         n_window: int = WINDOW_RANGE_FOR_EVENT,
+                         min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL) -> list[int]:
+    """Índices de las ventanas que disparan una alarma (regla clínica n-de-n).
 
-    start = inicio de la primera ventana positiva del episodio; end = fin de la última ventana positiva. Episodios separados por menos de `min_alarm_interval`
-    se fusionan en uno solo. Devuelve una lista de tuplas (start, end).
+    Dispara una alarma si en las últimas `n_window` ventanas consecutivas hay al menos
+    `n_within` predicciones positivas y pasó `min_alarm_interval` desde la alarma anterior.
+    Devuelve la lista de índices (en orden temporal) donde se disparó una alarma.
+    """
+    preds = np.asarray(predictions).reshape(-1).astype(bool)
+    times = np.asarray(decision_times, dtype=np.float64).reshape(-1)
+    if preds.shape != times.shape:
+        raise ValueError("predictions y decision_times deben tener igual longitud")
+    if n_within <= 0 or n_window <= 0 or n_within > n_window:
+        raise ValueError("Configuración de ventanas de evento inválida")
+    if min_alarm_interval < 0:
+        raise ValueError("min_alarm_interval no puede ser negativo")
+
+    alarm_indices: list[int] = []
+    last_alarm = -np.inf
+    recent: list[bool] = []
+    for i, t in enumerate(times):
+        recent.append(bool(preds[i]))
+        if len(recent) > n_window:
+            recent.pop(0)
+        if len(recent) >= n_window and sum(recent) >= n_within and t - last_alarm >= min_alarm_interval:
+            alarm_indices.append(i)
+            last_alarm = t
+    return alarm_indices
+
+
+def detect_event_intervals(window_starts, window_ends, predictions, *,
+                           n_within: int = POSITIVES_FOR_EVENT,
+                           n_window: int = WINDOW_RANGE_FOR_EVENT,
+                           min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL) -> list[tuple[float, float]]:
+    """Eventos detectados.
+
+    start = inicio de la primera ventana positiva de la ráfaga que disparó la alarma;
+    end = instante de decisión de la ventana que la disparó. Devuelve (start, end) por alarma.
     """
     starts = np.asarray(window_starts, dtype=np.float64)
     ends = np.asarray(window_ends, dtype=np.float64)
     preds = np.asarray(predictions).reshape(-1).astype(bool)
-    if starts.shape != ends.shape or starts.shape != preds.shape:
+    if not (starts.shape == ends.shape == preds.shape):
         raise ValueError("window_starts, window_ends y predictions deben tener igual longitud")
-    if min_alarm_interval < 0:
-        raise ValueError("min_alarm_interval no puede ser negativo")
+
+    alarm_indices = detect_alarm_indices(preds, ends, n_within=n_within, n_window=n_window,
+                                         min_alarm_interval=min_alarm_interval)
 
     events: list[tuple[float, float]] = []
-    event_start: float | None = None
-    event_end: float | None = None
-    #voy ventana por ventana, si la predicción es positiva, miro si estoy en un episodio o no. Si no estoy, inicio uno. Si estoy, miro si la ventana positiva está a menos de min_alarm_interval del final del episodio, si es así lo extiendo, sino cierro el episodio y abro uno nuevo
-    for i in range(len(preds)):
-        if not preds[i]:
-            continue
-        if event_start is None:
-            event_start = float(starts[i])
-            event_end = float(ends[i])
-        elif float(starts[i]) - event_end <= min_alarm_interval:
-            event_end = float(ends[i])
-        else:
-            events.append((event_start, event_end))
-            event_start = float(starts[i])
-            event_end = float(ends[i])
-    if event_start is not None and event_end is not None:
-        events.append((event_start, event_end))
+    for i in alarm_indices:
+        first_pos = i
+        for k in range(max(0, i - n_window + 1), i + 1):
+            if preds[k]:
+                first_pos = k
+                break
+        events.append((float(starts[first_pos]), float(ends[i])))
     return events
 
 
 def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotations,
-                  threshold: float, n_within: int = 3, n_window: int = 4,
-                  min_alarm_interval: float = 30.0, max_latency: float = 30.0) -> dict:
+                  threshold: float, n_within: int = POSITIVES_FOR_EVENT,
+                  n_window: int = WINDOW_RANGE_FOR_EVENT,
+                  min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL,
+                  max_latency: float = EVENT_MAX_LATENCY) -> dict:
     """
     Evaluación a nivel evento (como en el paper 1DCNN IEEE TNSRE 2025).
     Evalúa un umbral fijo así q lo llamo barias veces desde select_event_operating_point para que me decida cuál es mejor
@@ -189,20 +224,11 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
         #o sea este es un array de los tiempos en los q termina cada ventana
         win_times = decision_times_from_local_ids(local_ids[idx])
 
-        alarm_times: list[float] = []
-        last_alarm = -np.inf
-        recent: list[bool] = []
-        #por cada una de las ventanas, si hay n_within predicciones positivas en las últimas n_window ventanas consecutivas, 
-        # y no hubo alarma en los últimos min_alarm_interval segundos, dispara una alarma
-        for j, t in enumerate(win_times): #(contador, tiempo de decision)
-            recent.append(bool(predictions[j])) #miro ventana x ventana y anoto si esa ventana predijo o no crisis
-            if len(recent) > n_window: #mantengo solo las últimas n_window predicciones
-                recent.pop(0)
-            if len(recent) >= n_window and sum(recent) >= n_within: #si en las últimas n_window ventanas consecutivas hubo al menos n_within predicciones positivas, disparo alarma
-                if t - last_alarm >= min_alarm_interval:
-                    alarm_times.append(t)
-                    last_alarm = t
-        alarms_by_file[fid] = alarm_times
+        alarm_indices = detect_alarm_indices(
+            predictions, win_times,
+            n_within=n_within, n_window=n_window, min_alarm_interval=min_alarm_interval,
+        )
+        alarms_by_file[fid] = [float(win_times[i]) for i in alarm_indices]
 
     # Matcheo de alarmas contra crisis anotadas.
     n_seizures = 0
@@ -303,8 +329,11 @@ def event_metrics(probs, labels, *, file_ids, local_ids, valid_files, annotation
 
 
 def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
-                                 max_false_alarms_per_hour: float, n_within: int = 3, n_window: int = 4,
-                                 min_alarm_interval: float = 30.0, max_latency: float = 30.0,
+                                 max_false_alarms_per_hour: float,
+                                 n_within: int = POSITIVES_FOR_EVENT,
+                                 n_window: int = WINDOW_RANGE_FOR_EVENT,
+                                 min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL,
+                                 max_latency: float = EVENT_MAX_LATENCY,
                                  thresholds=None) -> tuple[dict | None, float | None]:
     """
     Punto de operación a nivel EVENTO: entre los umbrales con mediana de falsas alarmas por hora por paciente NO supera `max_false_alarms_per_hour`, se elige el
@@ -339,7 +368,12 @@ def select_event_operating_point(probs, labels, *, file_ids, local_ids, valid_fi
     return best, best_threshold
 
 
-def select_lowest_false_alarm_point(probs, labels, *, file_ids, local_ids, valid_files, annotations, n_within: int = 2,n_window: int = 3, min_alarm_interval: float = 30.0, max_latency: float = 30.0,  thresholds=None,) -> tuple[dict, float]:
+def select_lowest_false_alarm_point(probs, labels, *, file_ids, local_ids, valid_files, annotations,
+                                    n_within: int = POSITIVES_FOR_EVENT,
+                                    n_window: int = WINDOW_RANGE_FOR_EVENT,
+                                    min_alarm_interval: float = EVENT_MIN_ALARM_INTERVAL,
+                                    max_latency: float = EVENT_MAX_LATENCY,
+                                    thresholds=None,) -> tuple[dict, float]:
     """Fallback cuando ningún umbral cumple el techo clínico.
     """
     if thresholds is None:

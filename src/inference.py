@@ -24,7 +24,9 @@ from src.config import (
     BASE_DIR,
     EVENT_MIN_ALARM_INTERVAL,
     MODELS_DIR,
+    POSITIVES_FOR_EVENT,
     THRESHOLD,
+    WINDOW_RANGE_FOR_EVENT,
 )
 from src.evaluate import load_checkpoint, rebuild_model
 from src.train import get_device
@@ -81,6 +83,11 @@ def main() -> None:
     if threshold is None:
         threshold = THRESHOLD
 
+    event_config = checkpoint.get("event_config", {})
+    n_within = event_config.get("n_within", POSITIVES_FOR_EVENT)
+    n_window = event_config.get("n_window", WINDOW_RANGE_FOR_EVENT)
+    min_alarm_interval = event_config.get("min_alarm_interval", EVENT_MIN_ALARM_INTERVAL)
+
     path = Path(args.input)
     #proceso el archivo
     result = process_edf(path, [], scaler_stats=checkpoint["scaler_stats"])
@@ -113,14 +120,15 @@ def main() -> None:
         for i in range(len(probabilities))
     ]
 
-    # Postprocesado a nivel evento. hago el agrupamiento de ventanas positiva. La verdad esto es medio trampita... porque no estoy usando el mismo criterio de 2-de-3 que uso en 
-    #el entrenamiento. Pero bueno no es tan grave, porque el objetivo es que el usuario vea los eventos detectados. Con esto me reporta más las falsas alarmas
-    #y con el otro criterio se ve más recatado el output. Es un detalle menor pero tranquilamente lo puedo cambiar.
+    # Postprocesado a nivel evento con la MISMA regla clínica que la evaluación
+    # (>= n_within positivas en n_window ventanas consecutivas + intervalo mínimo entre alarmas).
     events = detect_event_intervals(
         window_starts,
         window_ends,
         predictions,
-        min_alarm_interval=EVENT_MIN_ALARM_INTERVAL,
+        n_within=n_within,
+        n_window=n_window,
+        min_alarm_interval=min_alarm_interval,
     )
 
     output = {

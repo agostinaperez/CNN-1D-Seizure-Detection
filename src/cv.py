@@ -44,6 +44,7 @@ from src.config import (
     SPLIT_FILE,
     THRESHOLD,
 )
+from src.cv_bias import save_predictions
 from src.evaluate import evaluate_checkpoint_on_split
 from src.preprocessing import compute_stats_for_patients
 from src.protocol import PROTOCOL_VERSION, split_id
@@ -226,8 +227,12 @@ def run_fold(config_id: str, config: dict, fold: dict,fold_split: dict, *, data_
         epochs=epochs, seed=seed, limit_files=limit_files, resume=True,)
 
     #vuelvo a cargar el checkpoint elegido y calculo las métricas finales del fold sobre su validación
+    # return_predictions=True además expone las probs/etiquetas crudas de cada ventana, que guardo para poder reanalizar el sesgo de umbral sin volver a evaluar
     eval_res = evaluate_checkpoint_on_split(ckpt, data_dir=data_dir, split=fold_split, split_name="val", device=device,
-    limit_files=limit_files, reselect_operating_point=False,)
+    limit_files=limit_files, reselect_operating_point=False, return_predictions=True,)
+
+    if "predictions" in eval_res:
+        save_predictions(out_dir, config_id, fold_idx, eval_res["predictions"])
 
     ev = eval_res["event"]
     return {

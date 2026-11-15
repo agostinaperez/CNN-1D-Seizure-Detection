@@ -47,3 +47,24 @@ def test_model_not_found(tmp_path, monkeypatch):
 
     client = TestClient(api.app)
     assert client.get("/api/models/nope.pt").status_code == 404
+
+
+def test_infer_rejects_invalid_edf_with_400(monkeypatch):
+    fake_state = {
+        "threshold": 0.5,
+        "checkpoint": {"scaler_stats": {}, "event_config": {}},
+        "model": None,
+        "device": "cpu",
+        "compute": {},
+    }
+    monkeypatch.setattr(api, "_load_model", lambda name: fake_state)
+
+    client = TestClient(api.app)
+    resp = client.post(
+        "/api/infer",
+        files={"file": ("malo.edf", b"esto no es un edf", "application/octet-stream")},
+        data={"model": "fake.pt"},
+    )
+
+    assert resp.status_code == 400
+    assert "edf_no_legible" in resp.json()["detail"]

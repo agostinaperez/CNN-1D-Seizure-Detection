@@ -1,12 +1,17 @@
 import numpy as np
 import pytest
 
+import src.preprocessing as pp
+
 from src.config import CHANNELS_TUEV, FS
 from src.preprocessing import (
+    ELECTRODES,
+    _solve_selection,
     apply_scaler,
     compute_stats_for_patients,
     filter_bandpass,
     label_windows,
+    load_16_channels,
     normalize_channel_name,
     segment_windows,
 )
@@ -15,8 +20,14 @@ from src.preprocessing import (
 def test_normalize_channel_name():
     assert normalize_channel_name("fp1-f7") == "FP1-F7"
     assert normalize_channel_name(" F7-CS2 ") == "F7-CS2"
-    # corrige "01" -> "O1" y recorta sufijos duplicados
+    # corrige "01" -> "O1"
     assert normalize_channel_name("F7-01") == "F7-O1"
+
+
+def test_normalize_channel_name_trims_numeric_suffix():
+    # recorta sufijos numéricos de canales duplicados
+    assert normalize_channel_name("FP1-F7-1") == "FP1-F7"
+    assert normalize_channel_name("F7-CS2-2") == "F7-CS2"
 
 
 def test_filter_bandpass_keeps_shape_and_is_finite():
@@ -25,6 +36,20 @@ def test_filter_bandpass_keeps_shape_and_is_finite():
     out = filter_bandpass(data, fs=FS)
     assert out.shape == data.shape
     assert np.isfinite(out).all()
+
+
+def test_filter_bandpass_attenuates_out_of_band():
+    fs = FS
+    t = np.arange(4096) / fs
+    in_band = np.sin(2 * np.pi * 10 * t)
+    out_of_band = np.sin(2 * np.pi * 100 * t)
+    y_in = filter_bandpass(in_band[None, :], fs=fs)[0]
+    y_out = filter_bandpass(out_of_band[None, :], fs=fs)[0]
+    core = slice(512, -512)  # descarto el transitorio del filtro de fase cero
+    rms_in = float(np.sqrt(np.mean(y_in[core] ** 2)))
+    rms_out = float(np.sqrt(np.mean(y_out[core] ** 2)))
+    assert rms_in > 0.5             # 10 Hz está dentro de la banda -> pasa
+    assert rms_out < 0.05 * rms_in  # 100 Hz queda fuertemente atenuado
 
 
 def test_filter_bandpass_rejects_invalid_params():
@@ -41,6 +66,82 @@ def test_segment_windows():
     assert starts[0] == 0 and starts[1] == 655
 
 
+def test_segment_windows_content_matches_starts():
+    rng = np.random.default_rng(7)
+    data = rng.normal(size=(2, 5000)).astype(np.float32)
+    win, stride = 1310, 655
+    windows, starts = segment_windows(data, win_samples=win, stride=stride)
+    for i in range(windows.shape[0]):
+        np.testing.assert_allclose(windows[i], data[:, starts[i]:starts[i] + win])
+
+
+# ---------------------------------------------------------------- canales (montaje)
+def test_solve_selection_direct_bipolar():
+    plan = _solve_selection([normalize_channel_name(c) for c in CHANNELS_TUEV])
+    assert plan is not None
+    for i, ch in enumerate(CHANNELS_TUEV):
+        assert plan[ch] == ("row", i)
+
+
+def test_solve_selection_monopolar_reconstruction():
+    # todos los canales referidos a CS2 -> los bipolares se reconstruyen por resta
+    ch_names = [f"{e}-CS2" for e in ELECTRODES]
+    plan = _solve_selection(ch_names)
+    assert plan is not None
+    idx = {e: i for i, e in enumerate(ELECTRODES)}
+    assert plan["FP1-F7"] == ("diff", idx["FP1"], idx["F7"])
+    assert plan["T8-P8"] == ("diff", idx["T8"], idx["P8"])
+
+
+def test_solve_selection_incompatible_returns_none():
+    assert _solve_selection(["FP1-CS2"]) is None  # falta F7 -> no se arma FP1-F7
+
+
+class _FakeRaw:
+    def __init__(self, ch_names, sfreq, data):
+        self.info = {"sfreq": sfreq}
+        self.ch_names = list(ch_names)
+        self._data = data
+
+    def get_data(self):
+        return self._data
+
+    def close(self):
+        pass
+
+
+def _install_fake_raw(monkeypatch, ch_names, sfreq, data):
+    monkeypatch.setattr(pp.mne.io, "read_raw_edf", lambda *a, **k: _FakeRaw(ch_names, sfreq, data))
+
+
+def test_load_16_channels_direct_bipolar(monkeypatch):
+    n = 100
+    data = np.arange(16 * n, dtype=float).reshape(16, n)
+    _install_fake_raw(monkeypatch, CHANNELS_TUEV, FS, data)
+    out, reason = load_16_channels("dummy.edf", fs_expected=FS)
+    assert reason is None
+    np.testing.assert_array_equal(out, data)
+
+
+def test_load_16_channels_reconstructs_by_diff(monkeypatch):
+    n = 50
+    ch_names = [f"{e}-CS2" for e in ELECTRODES]
+    data = np.random.default_rng(0).normal(size=(len(ch_names), n))
+    _install_fake_raw(monkeypatch, ch_names, FS, data)
+    out, reason = load_16_channels("dummy.edf", fs_expected=FS)
+    assert reason is None
+    idx = {e: i for i, e in enumerate(ELECTRODES)}
+    expected_fp1f7 = data[idx["FP1"]] - data[idx["F7"]]
+    np.testing.assert_allclose(out[0], expected_fp1f7)  # FP1-F7 es el canal 0
+
+
+def test_load_16_channels_rejects_wrong_sampling_rate(monkeypatch):
+    data = np.zeros((16, 100))
+    _install_fake_raw(monkeypatch, CHANNELS_TUEV, 128, data)
+    out, reason = load_16_channels("dummy.edf", fs_expected=FS)
+    assert out is None and "sampling_rate" in reason
+
+
 def test_label_windows_overlap():
     starts = np.array([0, 655, 1310], dtype=np.int64)
     labels = label_windows(starts, 3, [(1.0, 3.0)], fs=FS, win_seconds=1310 / FS)
@@ -48,16 +149,33 @@ def test_label_windows_overlap():
 
 
 def test_apply_scaler():
-    windows = np.full((2, 16, 10), 5.0, dtype=np.float32)
+    windows = np.arange(2 * 16 * 3, dtype=np.float32).reshape(2, 16, 3)
+    median = np.arange(1, 17, dtype=np.float64)
+    iqr = np.arange(2, 18, dtype=np.float64)
     stats = {
         "channels": list(CHANNELS_TUEV),
-        "median": np.zeros(16, dtype=np.float64),
-        "iqr": np.ones(16, dtype=np.float64),
+        "median": median,
+        "iqr": iqr,
     }
+
     out = apply_scaler(windows, stats)
     assert out.shape == windows.shape
     assert out.dtype == np.float32
-    np.testing.assert_allclose(out, 5.0)
+    expected = (windows - median[None, :, None]) / iqr[None, :, None]
+    np.testing.assert_allclose(out, expected)
+
+
+def test_apply_scaler_uses_one_as_denominator_for_zero_iqr():
+    windows = np.arange(16, dtype=np.float32).reshape(1, 16, 1)
+    median = np.zeros(16, dtype=np.float64)
+    iqr = np.full(16, 2.0, dtype=np.float64)
+    iqr[0] = 0.0
+    stats = {"channels": list(CHANNELS_TUEV), "median": median, "iqr": iqr}
+
+    out = apply_scaler(windows, stats)
+
+    expected = windows / np.where(iqr == 0, 1.0, iqr)[None, :, None]
+    np.testing.assert_allclose(out, expected)
 
 
 def test_compute_stats_for_patients_filters_by_patient(tmp_path, monkeypatch):

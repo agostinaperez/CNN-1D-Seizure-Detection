@@ -52,7 +52,6 @@ Se usa el CHB-MIT Scalp EEG Database, un dataset clínico de dominio público de
 | Período / cobertura | Monitoreo continuo pediátrico, múltiples sesiones por paciente |
 | Licencia del dataset | Público (PhysioNet); uso académico. No redistribuido aquí |
 
----
 
 ## Metodología
 
@@ -82,7 +81,9 @@ Se implementó una validación cruzada agrupada por paciente para evaluar las co
 
 La partición se realiza por paciente, no por ventana, para mantener todas las ventanas de cada paciente en un mismo grupo. Se utiliza StratifiedGroupKFold con K=5 y estratificación por severidad de crisis. Los 18 pacientes del pool de desarrollo rotan y aparecen una vez cada uno en validación. El conjunto de test del split fijo se mantiene separado durante la validación cruzada.
 
-En cada fold, las estadísticas del RobustScaler se calculan únicamente con los pacientes de entrenamiento de ese fold. Se comparan las configuraciones `bce`, `focal_a025` y `focal_a075`, manteniendo constantes los demás parámetros del entrenamiento. Para cada configuración se ejecutan cinco entrenamientos, uno por fold, y se reportan AUPRC, AUC-ROC, sensibilidad de evento y falsas alarmas por hora, agregadas entre folds.
+En cada fold, las estadísticas del RobustScaler se calculan únicamente con los pacientes de entrenamiento de ese fold. Se comparan las configuraciones `bce`, `focal_a025` y `focal_a075`, manteniendo constantes los demás parámetros del entrenamiento.
+
+#### Resultados medidos sobre el propio fold
 
 | Configuración | AUPRC (mediana, IQR) | AUC-ROC (mediana, IQR) | Sens. evento (pooled) | FA/h mediana (mediana, IQR) |
 |---|---|---|---|---|
@@ -90,9 +91,53 @@ En cada fold, las estadísticas del RobustScaler se calculan únicamente con los
 | `focal_a025` | 0,138 (0,037–0,318) | 0,874 (0,838–0,916) | 55,5 % (91/164) | 0,725 (0,642–0,798) |
 | `focal_a075` | 0,093 (0,018–0,326) | 0,874 (0,840–0,928) | 50,0 % (82/164) | 0,713 (0,410–0,756) |
 
-La configuración se selecciona según la mediana de AUPRC de validación; en caso de empate, se prefiere la de menor IQR. Luego se reentrena esa configuración con todo el pool de desarrollo y se evalúa una vez sobre el conjunto de test.
+La configuración se selecciona según la mediana de AUPRC de validación; en caso de empate, se prefiere la de menor IQR. Luego se reentrena esa configuración con todo el pool de desarrollo y se evalúa una vez sobre el conjunto de test. 
 
----
+#### Sesgo de selección y cifras corregidas
+Los números de la tabla anterior se encuentran sesgados, ya que la elección de la mejor época y del threshold a utilizar se deciden con la información del mismo fold, generando métricas de validación optimistas. El conjunto de test y sus métricas derivadas no cuentan con este sesgo, ya que el umbral y la cantidad de épocas del refit se fijan antes de ver dicho conjunto. 
+Estos sesgos se detectan y cuantifican implementando la técnica de "leave one out", una vez terminados los 5 entrenamientos de cada configuración; los resultados reportados se pueden reproducir ejecutando:
+
+```bash
+# Época: usa las curvas por época ya guardadas.
+python -m src.cv_bias --out-dir cv_run --epoch-bias
+
+# Umbral: requiere las predicciones por fold (regeneralas primero si no están).
+python -m src.cv_bias --out-dir cv_run --regenerate-predictions --data-dir <chbmit> --split-file data/processed/split.json
+python -m src.cv_bias --out-dir cv_run --threshold-bias
+```
+
+El reporte se escribe en `cv_run/cv_bias_report.json`.
+
+##### Época
+
+Para el fold k se usa como referencia la mediana de los mejores epochs de los otros 4 folds (los guardados por cada uno durante sus entrenamientos) y se lee las métricas de k en esa época (guardada en `fold*.history.json`), comparándola contra la reportada en su propio best_epoch.
+
+| Configuración | Métrica | Reportado | Debiased | Sesgo |
+|---|---|---|---|---|
+| `bce` | AUPRC | 0,118 | 0,182 | −0,064 |
+| `bce` | AUC-ROC | 0,842 | 0,853 | −0,011 |
+| `bce` | Sens. evento | 0,355 | 0,258 | +0,097 |
+| `focal_a025` | AUPRC | 0,138 | 0,144 | −0,006 |
+| `focal_a025` | AUC-ROC | 0,874 | 0,812 | +0,062 |
+| `focal_a025` | Sens. evento | 0,484 | 0,270 | +0,214 |
+| `focal_a075` | AUPRC | 0,093 | 0,111 | −0,018 |
+| `focal_a075` | AUC-ROC | 0,874 | 0,796 | +0,078 |
+| `focal_a075` | Sens. evento | 0,387 | 0,278 | +0,109 |
+
+- AUPRC y AUC-ROC cambian poco. Como la ganadora se elige por la *mediana de AUPRC*, esa decisión no queda comprometida por el sesgo.
+- En `focal_a025` la sensibilidad reportada (0,48) cae a 0,27 al medir en la época mediana de los otros folds, un sesgo de +0,21. Es un artefacto de medir sobre el mismo fold que eligió el checkpoint, no una limitación del modelo.
+
+##### Umbral
+
+Para el fold k, el umbral se elige con las predicciones de validación de los otros folds y se reevalúa el fold k con ese umbral (el umbral nunca usa las etiquetas del fold que se reporta).
+
+| Configuración | Umbral reportado | Umbral LOO | Sens. reportada | Sens. LOO |
+|---|---|---|---|---|
+| `bce` | 0,80 | 0,75 | 0,355 | 0,630 |
+| `focal_a025` | 0,40 | 0,50 | 0,484 | 0,550 |
+| `focal_a075` | 0,75 | 0,70 | 0,387 | 0,550 |
+
+El sesgo de umbral no infla la sensibilidad, ya que el elegido sobre otros folds da una sensibilidad similar o mayor porque el umbral propio estaba limitado por el techo de 1 falsa alarma/hora sobre el propio fold (bce, con la FA/h más alta, tuvo que subir a 0,80 y eso recortó su sensibilidad). Debido a que el umbral LOO no garantiza respetar ese techo sobre el fold que se mide, no implica un desempeño superior en el sentido clínico, simplemente es una referencia de cuánto se transfiere el umbral entre los folds.
 
 ## Resultados y comparación contra baseline
 
@@ -101,7 +146,7 @@ de ingeniería (potencia espectral de cada ventana en las bandas canónicas del 
 
 `Focal α=.25 (final)` es el modelo entrenado con el split fijo train/val y punto de operación elegido en validación; `Focal α=.25 (refit CV)` es el ganador de la validación cruzada (`focal_a025`) reentrenado sobre todo el pool de desarrollo (18 pacientes) y evaluado una sola vez sobre test con umbral fijo 0,42.
 
-| Métrica  | Regresión logística | SVM lineal | BCE | Focal α=.25 (final) | Focal α=.25 (refit CV) |
+| Métrica  | Regresión logística | SVM lineal | BCE (sin CV) | Focal α=.25 (sin CV) | Focal α=.25 (refit CV) |
 |----------|---------------------|-----------|-----|---------------------|------------------------|
 | AUC-ROC | 0,694 | 0,710 | 0,8915 | 0,8957 | 0,8606 |
 | AUPRC   | 0,030 | 0,064 | 0,3736 | 0,3881 | 0,3994 |
@@ -115,6 +160,14 @@ de ingeniería (potencia espectral de cada ventana en las bandas canónicas del 
 Focal α=.25 es superior a BCE en ranking (AUPRC y AUC) y en la mayoría de las métricas de ventana: reduce los falsos positivos (~36 % menos de FPR) y mejora MCC.
 En comparación con los baselines, la CNN supera ampliamente a ambos: mejora el AUC-ROC de ~0,71 a 0,86, multiplica el AUPRC por más de 6 (0,39 vs 0,06), detecta más del doble de crisis (19/34 vs 9/34 y 6/34). El SVM lineal logra respetar el techo clínico de falsas alarmas (0,41/h) pero a costa de una sensibilidad muy baja (17,6 %).
 
+### Intervalo de confianza de la sensibilidad
+
+La sensibilidad de evento del modelo ganador (refit CV) es 19 de 34 crisis, es decir 55,9 %. Al ser una proporción estimada sobre una muestra finita, ese número tiene un margen de error. Para cuantificarlo se usa un intervalo de confianza del 95 % para una proporción binomial.
+
+Con `x = 19` aciertos sobre `n = 34`, la proporción muestral es `p̂ = 19/34 = 0,559`. El intervalo de Wilson (más robusto que el clásico para muestras pequeñas) da como resultado IC 95 % = 0,553 ± 0,158 = [0,394 ; 0,711], es decir 39,5 % a 71,1 %.
+
+En consecuencia, se puede concluir que el desempeño es mejor que el de los modelos baseline, pero como las estimaciones de los demás modelos caen dentro del rango de incertidumbre del refit  (67,6 % para el Focal Loss sin CV, y 64,7% para el BCE sin CV), la comparación entre modelos no es concluyente y no permite distinguir una mejora real de una fluctuación por azar. Esta es una limitación del proyecto generada por el tamaño del test, y del dataset en general.
+
 ### Análisis crítico
 
 El modelo es un MVP funcional que supera a los baselines, pero no alcanza todavía los objetivos clínicos:
@@ -124,8 +177,6 @@ El modelo es un MVP funcional que supera a los baselines, pero no alcanza todav�
 - La variabilidad entre pacientes es extrema: `chb20` (8/8) y `chb09` (4/4) se detectan por completo, mientras que `chb16` (2/10), `chb18` (2/6) y `chb17` (1/3) quedan muy por debajo. Las crisis cortas (`chb16`, ~8 s) siguen siendo el punto débil, y es un problema de representación de datos, no de la función de pérdida.
 - `chb09` es el único paciente que excede el techo de falsas alarmas (1,59/h) pese a detectar todas sus crisis, lo que confirma que el desglose por paciente importa tanto como el agregado.
 - Con 34 crisis de test, la diferencia entre configuraciones sigue teniendo mucha incertidumbre estadística.
-
----
 
 ## Estructura del proyecto
 
@@ -156,10 +207,10 @@ El modelo es un MVP funcional que supera a los baselines, pero no alcanza todav�
 El sitio estático con la documentación y los resultados del proyecto se encuentra en
 [`docs/`](docs/). El workflow de GitHub Actions lo publica al hacer push a `main`.
 
-Para habilitarlo en el repositorio, ir a **Settings → Pages** y seleccionar **GitHub
-Actions** como fuente de publicación. Una vez que termine el workflow
-**Deploy project site to GitHub Pages**, el sitio estará disponible en
-`https://agostinaperez.github.io/ia-final/`.
+Para habilitarlo en el repositorio, ir a Settings → Pages y seleccionar GitHub
+Actions como fuente de publicación. Una vez que termine el workflow
+Deploy project site to GitHub Pages, el sitio estará disponible en
+`https://agostinaperez.github.io/CNN-1D-Seizure-Detection/`.
 
 GitHub Pages publica esta documentación estática; no ejecuta FastAPI ni la inferencia
 del modelo. La demo interactiva descrita abajo requiere un backend Python en ejecución.
@@ -178,8 +229,8 @@ del modelo. La demo interactiva descrita abajo requiere un backend Python en eje
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/agostinaperez/ia-final.git
-cd ia-final
+git clone https://github.com/agostinaperez/CNN-1D-Seizure-Detection.git
+cd CNN-1D-Seizure-Detection
 
 # 2. Crear el entorno virtual y activarlo (Python 3.11+)
 python -m venv .venv
@@ -190,7 +241,7 @@ python -m venv .venv
 pip install -e .
 
 # 4. Descargar el checkpoint de la última Release y dejarlo en models/
-#    (ej.: https://github.com/agostinaperez/ia-final/releases -> alpha025.pt)
+#    (ej.: https://github.com/agostinaperez/CNN-1D-Seizure-Detection/releases -> alpha025.pt)
 ```
 
 El dataset solo se necesita para el pipeline completo. En ese caso, setear su ruta en `.env` (`CHBMIT_DIR`, a partir de `.env.example`) o pasar `--data-dir <ruta>` a cada script.
